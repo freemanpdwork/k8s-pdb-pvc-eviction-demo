@@ -1,0 +1,5 @@
+# Moved to kind/cluster.yaml (primary cluster config for this demo).
+#
+#   make cluster
+#
+# This file is kept for reference only.

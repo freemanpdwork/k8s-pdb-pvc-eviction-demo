@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Default (relaxed PDB) — prefer overlays/relaxed for deploy targets
+resources:
+  - namespace.yaml
+  - statefulset.yaml
+  - service.yaml
+  - pdb-relaxed.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: demo-app

@@ -1,0 +1,299 @@
+# k8s PDB + PVC + eviction demo — primary UX entrypoint
+# Uses kind (3 nodes: 1 control-plane + 2 workers). See README.md for Docker Desktop fallback.
+SHELL := /bin/bash
+.DEFAULT_GOAL := help
+
+CLUSTER_NAME    ?= pdb-pvc-demo
+KIND_CONFIG     ?= kind/cluster.yaml
+KUBECONFIG_FILE ?= $(CURDIR)/.kube/kind-$(CLUSTER_NAME)
+ifneq (,$(wildcard $(KUBECONFIG_FILE)))
+export KUBECONFIG := $(KUBECONFIG_FILE)
+endif
+
+NAMESPACE       ?= demo
+STATEFULSET     ?= demo-app
+DEMO_REPO_URL   ?= https://github.com/freemanpdwork/k8s-pdb-pvc-eviction-demo.git
+DEMO_OVERLAY    ?= manifests/k8s-demo/overlays/relaxed
+STRICT_OVERLAY  ?= manifests/k8s-demo/overlays/strict
+ARGOCD_NS       ?= argocd
+ARGOCD_INSTALL  ?= https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+RELAXED_KUSTOMIZE := manifests/k8s-demo/overlays/relaxed
+STRICT_KUSTOMIZE  := manifests/k8s-demo/overlays/strict
+KUSTOMIZE_FLAGS   := --load-restrictor LoadRestrictionsNone
+
+define kustomize_apply
+	kubectl kustomize $(1) $(KUSTOMIZE_FLAGS) | kubectl apply -f -
+endef
+
+define kustomize_delete
+	kubectl kustomize $(1) $(KUSTOMIZE_FLAGS) | kubectl delete -f - --ignore-not-found
+endef
+
+.PHONY: help setup cluster cluster-delete check-cluster fix-context argocd argocd-password argocd-app argocd-wait \
+        port-forward deploy deploy-direct deploy-strict pdb-relaxed pdb-strict \
+        demo-data wait-ready status logs evict drain uncordon teardown clean \
+        dry-run validate
+
+help: ## Show available targets
+	@grep -E '^[a-zA-Z0-9_.-]+:.*##' $(MAKEFILE_LIST) | sort | \
+		awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+
+setup: ## Create kind cluster, install Argo CD, sync app via GitOps, write demo data
+	@$(MAKE) cluster
+	@$(MAKE) argocd
+	@$(MAKE) argocd-app
+	@$(MAKE) demo-data
+	@$(MAKE) status
+	@echo ""
+	@echo "Demo ready. Argo CD UI: make port-forward (then http://localhost:8080 — no login)"
+	@echo "Application 'demo-app' is registered and synced from $(DEMO_REPO_URL)"
+
+cluster: ## Create kind cluster if missing and export kubeconfig
+	@command -v kind >/dev/null || { echo "kind is required. Install: https://kind.sigs.k8s.io/" >&2; exit 1; }
+	@command -v docker >/dev/null || { echo "docker is required (kind runs on Docker)." >&2; exit 1; }
+	@mkdir -p $(dir $(KUBECONFIG_FILE))
+	@if kind get clusters 2>/dev/null | grep -qx '$(CLUSTER_NAME)'; then \
+		echo "kind cluster '$(CLUSTER_NAME)' already exists"; \
+	else \
+		echo "Creating kind cluster '$(CLUSTER_NAME)' from $(KIND_CONFIG)..."; \
+		kind create cluster --name $(CLUSTER_NAME) --config $(KIND_CONFIG); \
+	fi
+	@kind export kubeconfig --name $(CLUSTER_NAME) --kubeconfig $(KUBECONFIG_FILE)
+	@echo "Kubeconfig written to $(KUBECONFIG_FILE)"
+	@echo "Context: kind-$(CLUSTER_NAME)"
+	@echo "Run: export KUBECONFIG=$(KUBECONFIG_FILE)"
+	@echo "Or:  make check-cluster (Makefile auto-exports KUBECONFIG when the file exists)"
+
+cluster-delete: ## Delete kind cluster and local kubeconfig
+	@command -v kind >/dev/null || { echo "kind is required." >&2; exit 1; }
+	@if kind get clusters 2>/dev/null | grep -qx '$(CLUSTER_NAME)'; then \
+		echo "Deleting kind cluster '$(CLUSTER_NAME)'..."; \
+		kind delete cluster --name $(CLUSTER_NAME); \
+	else \
+		echo "kind cluster '$(CLUSTER_NAME)' not found (nothing to delete)"; \
+	fi
+	@rm -f $(KUBECONFIG_FILE)
+
+check-cluster: ## Verify kind cluster is reachable and nodes are ready
+	@command -v kubectl >/dev/null || { echo "kubectl is required but not installed." >&2; exit 1; }
+	@command -v kind >/dev/null || { echo "kind is required. Install: https://kind.sigs.k8s.io/" >&2; exit 1; }
+	@if [[ ! -f "$(KUBECONFIG_FILE)" ]]; then \
+		echo "Kubeconfig not found at $(KUBECONFIG_FILE)." >&2; \
+		echo "Create the cluster: make cluster" >&2; \
+		exit 1; \
+	fi
+	@export KUBECONFIG="$(KUBECONFIG_FILE)"; \
+	ctx=$$(kubectl config current-context 2>/dev/null || true); \
+	expected="kind-$(CLUSTER_NAME)"; \
+	if [[ -z "$$ctx" ]]; then \
+		echo "WARNING: current context is '' (expected $$expected)." >&2; \
+		echo "" >&2; \
+		echo "Quick fix:" >&2; \
+		echo "  1. Run: make cluster" >&2; \
+		echo "  2. Run: make fix-context" >&2; \
+		echo "  3. Or: export KUBECONFIG=$(KUBECONFIG_FILE)" >&2; \
+		echo "" >&2; \
+		echo "See README.md → Troubleshooting for details." >&2; \
+		exit 1; \
+	fi; \
+	case "$$ctx" in \
+		kind-$(CLUSTER_NAME)) \
+			echo "kubectl context: $$ctx (kind)";; \
+		docker-desktop|docker-for-desktop*) \
+			echo "kubectl context: $$ctx (Docker Desktop — see README.md for kind setup)";; \
+		*) \
+			echo "WARNING: current context is '$$ctx' (expected kind-$(CLUSTER_NAME))." >&2; \
+			echo "Switch with: kubectl config use-context kind-$(CLUSTER_NAME)" >&2; \
+			echo "Or run: make fix-context" >&2; \
+			if [[ -n "$$KUBECONFIG" && "$$KUBECONFIG" != "$(KUBECONFIG_FILE)" ]]; then \
+				echo "Stale KUBECONFIG? Run: export KUBECONFIG=$(KUBECONFIG_FILE)" >&2; \
+			fi;; \
+	esac
+	@export KUBECONFIG="$(KUBECONFIG_FILE)"; \
+	kubectl cluster-info >/dev/null 2>&1 || { \
+		echo "Cluster unreachable. Is the kind cluster running?" >&2; \
+		echo "  - docker ps | grep $(CLUSTER_NAME)" >&2; \
+		echo "  - make cluster  (recreate if needed)" >&2; \
+		echo "See README.md → Troubleshooting." >&2; \
+		exit 1; \
+	}
+	@export KUBECONFIG="$(KUBECONFIG_FILE)"; \
+	node_count=$$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+	worker_count=$$(kubectl get nodes --no-headers -l '!node-role.kubernetes.io/control-plane' 2>/dev/null | wc -l | tr -d ' '); \
+	echo "Nodes: $$node_count ($$worker_count worker(s))"; \
+	kubectl get nodes -o wide; \
+	if [[ "$$worker_count" -lt 2 ]]; then \
+		echo ""; \
+		echo "WARNING: fewer than 2 workers — pod spread and drain demos work best with 2 workers."; \
+		echo "  Expected: make cluster (uses $(KIND_CONFIG): 1 control-plane + 2 workers)"; \
+		echo "  Eviction/PDB behavior still works; pods may land on the same node."; \
+	fi
+
+fix-context: ## Fix empty/wrong kubectl context (kind or Docker Desktop)
+	@command -v kubectl >/dev/null || { echo "kubectl is required but not installed." >&2; exit 1; }
+	@if [[ -f "$(KUBECONFIG_FILE)" ]]; then \
+		export KUBECONFIG="$(KUBECONFIG_FILE)"; \
+		echo "Using kind kubeconfig: $(KUBECONFIG_FILE)"; \
+	elif [[ -n "$$KUBECONFIG" ]]; then \
+		stale=0; \
+		IFS=':' read -ra cfgs <<< "$$KUBECONFIG"; \
+		for cfg in "$${cfgs[@]}"; do \
+			if [[ ! -f "$$cfg" ]]; then \
+				echo "WARNING: KUBECONFIG points to missing file: $$cfg" >&2; \
+				stale=1; \
+			fi; \
+		done; \
+		if [[ $$stale -eq 1 ]]; then \
+			echo "Unset stale KUBECONFIG: unset KUBECONFIG" >&2; \
+			echo "" >&2; \
+		fi; \
+	fi
+	@echo "Available contexts:"
+	@kubectl config get-contexts || true
+	@echo ""
+	@if [[ -f "$(KUBECONFIG_FILE)" ]]; then \
+		export KUBECONFIG="$(KUBECONFIG_FILE)"; \
+		if kubectl config get-contexts -o name 2>/dev/null | grep -qx 'kind-$(CLUSTER_NAME)'; then \
+			echo "Switching to kind-$(CLUSTER_NAME)..."; \
+			kubectl config use-context kind-$(CLUSTER_NAME); \
+		else \
+			echo "ERROR: kind-$(CLUSTER_NAME) context not found in $(KUBECONFIG_FILE)." >&2; \
+			echo "Run: make cluster" >&2; \
+			exit 1; \
+		fi; \
+	elif kubectl config get-contexts -o name 2>/dev/null | grep -qx 'kind-$(CLUSTER_NAME)'; then \
+		echo "Switching to kind-$(CLUSTER_NAME)..."; \
+		kubectl config use-context kind-$(CLUSTER_NAME); \
+	elif kubectl config get-contexts -o name 2>/dev/null | grep -qx 'docker-desktop'; then \
+		echo "Switching to docker-desktop (Docker Desktop fallback)..."; \
+		kubectl config use-context docker-desktop; \
+	elif kubectl config get-contexts -o name 2>/dev/null | grep -qx 'docker-for-desktop'; then \
+		echo "Switching to docker-for-desktop (older Docker Desktop)..."; \
+		kubectl config use-context docker-for-desktop; \
+	else \
+		echo "ERROR: No kind-$(CLUSTER_NAME), docker-desktop, or docker-for-desktop context found." >&2; \
+		echo "Create kind cluster: make cluster" >&2; \
+		echo "Or enable Kubernetes in Docker Desktop (README.md → Alternative)." >&2; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "Verifying cluster access..."
+	@kubectl get nodes || { \
+		echo "Cluster unreachable." >&2; \
+		echo "kind: make cluster && export KUBECONFIG=$(KUBECONFIG_FILE)" >&2; \
+		echo "Docker Desktop: enable Kubernetes and wait for it to start." >&2; \
+		echo "See README.md → Troubleshooting." >&2; \
+		exit 1; \
+	}
+
+argocd: check-cluster ## Install Argo CD and wait for server ready
+	@kubectl get namespace $(ARGOCD_NS) >/dev/null 2>&1 || kubectl create namespace $(ARGOCD_NS)
+	@kubectl apply --server-side --force-conflicts -n $(ARGOCD_NS) -f $(ARGOCD_INSTALL)
+	@echo "Applying local demo config (anonymous admin, insecure HTTP)..."
+	@kubectl apply -n $(ARGOCD_NS) -f manifests/argocd/insecure-anonymous.yaml
+	@kubectl rollout restart deployment/argocd-server -n $(ARGOCD_NS)
+	@echo "Waiting for argocd-server..."
+	@kubectl rollout status deployment/argocd-server -n $(ARGOCD_NS) --timeout=300s
+	@kubectl rollout status deployment/argocd-repo-server -n $(ARGOCD_NS) --timeout=300s
+	@kubectl rollout status deployment/argocd-applicationset-controller -n $(ARGOCD_NS) --timeout=300s 2>/dev/null || true
+	@echo "Argo CD is ready. Dashboard: make port-forward (http://localhost:8080 — no login)"
+
+argocd-password: ## Print initial Argo CD admin password
+	@kubectl -n $(ARGOCD_NS) get secret argocd-initial-admin-secret \
+		-o jsonpath='{.data.password}' 2>/dev/null | base64 -d; echo
+
+port-forward: ## Port-forward Argo CD UI to http://localhost:8080 (leave running)
+	@echo "Forwarding http://localhost:8080 -> argocd-server:80 (Ctrl+C to stop)"
+	@kubectl port-forward svc/argocd-server -n $(ARGOCD_NS) 8080:80
+
+deploy: deploy-direct ## Apply relaxed overlay via kubectl (works offline)
+deploy-direct: ## kubectl apply relaxed overlay (no Argo CD required)
+	@$(call kustomize_apply,$(RELAXED_KUSTOMIZE))
+	@$(MAKE) wait-ready
+
+deploy-strict: ## Apply strict PDB overlay via kubectl
+	@$(call kustomize_apply,$(STRICT_KUSTOMIZE))
+	@$(MAKE) wait-ready
+
+argocd-app: ## Register Argo CD Application and wait until Synced/Healthy
+	@sed 's|DEMO_REPO_URL_PLACEHOLDER|$(DEMO_REPO_URL)|g' manifests/argocd/application.yaml | \
+		kubectl apply -f -
+	@echo "Argo CD Application applied. repoURL=$(DEMO_REPO_URL)"
+	@$(MAKE) argocd-wait
+
+argocd-wait: check-cluster ## Wait for demo-app Application Synced and Healthy in Argo CD
+	@echo "Waiting for Argo CD to sync demo-app from $(DEMO_REPO_URL)..."
+	@echo "(Manifests must exist at $(DEMO_OVERLAY) in that repo — push your fork if using DEMO_REPO_URL override)"
+	@kubectl wait --for=condition=Synced application/demo-app -n $(ARGOCD_NS) --timeout=300s || { \
+		echo "ERROR: demo-app did not reach Synced within 300s." >&2; \
+		echo "Push manifests to $(DEMO_REPO_URL) or set DEMO_REPO_URL to a reachable repo." >&2; \
+		echo "Offline fallback: make deploy-direct" >&2; \
+		kubectl get application demo-app -n $(ARGOCD_NS) -o jsonpath='{.status.conditions}' 2>/dev/null; echo; \
+		exit 1; \
+	}
+	@kubectl wait --for=condition=Healthy application/demo-app -n $(ARGOCD_NS) --timeout=300s || { \
+		echo "ERROR: demo-app did not reach Healthy within 300s." >&2; \
+		echo "Offline fallback: make deploy-direct" >&2; \
+		kubectl get application demo-app -n $(ARGOCD_NS) -o jsonpath='{.status.conditions}' 2>/dev/null; echo; \
+		exit 1; \
+	}
+	@echo "demo-app is Synced and Healthy."
+
+pdb-relaxed: ## Switch to relaxed PDB (minAvailable: 1)
+	@$(call kustomize_apply,$(RELAXED_KUSTOMIZE))
+	@kubectl get pdb -n $(NAMESPACE)
+
+pdb-strict: ## Switch to strict PDB (minAvailable: 2) — blocks eviction/drain
+	@$(call kustomize_apply,$(STRICT_KUSTOMIZE))
+	@kubectl get pdb -n $(NAMESPACE)
+	@echo "Strict PDB active: voluntary eviction of any pod should be blocked."
+
+demo-data: wait-ready ## Write unique marker files to each pod's PVC at /data
+	@./scripts/write-data.sh
+
+wait-ready: ## Wait for StatefulSet, pods, PVCs, and PDB
+	@./scripts/wait-ready.sh
+
+status: ## Show pods, PVCs, PDB, and node placement
+	@echo "=== Nodes ==="
+	@kubectl get nodes -o wide
+	@echo ""
+	@echo "=== demo namespace ==="
+	@kubectl get pods,pvc,pdb,svc -n $(NAMESPACE) -o wide 2>/dev/null || \
+		echo "Namespace $(NAMESPACE) not found — run 'make deploy'"
+	@echo ""
+	@echo "=== Argo CD Application ==="
+	@kubectl get application demo-app -n $(ARGOCD_NS) 2>/dev/null || \
+		echo "(no Argo CD Application — run 'make argocd-app' or 'make setup')"
+
+logs: ## Tail logs from demo-app pods
+	@kubectl logs -n $(NAMESPACE) -l app=demo-app --tail=50 --prefix=true
+
+evict: ## Evict one demo pod (shows PDB allow/block)
+	@./scripts/evict-pod.sh
+
+drain: ## Cordon and drain a worker running demo pods
+	@./scripts/drain-node.sh || true
+
+uncordon: ## Uncordon all nodes (post-drain cleanup)
+	@for node in $$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do \
+		kubectl uncordon "$$node" 2>/dev/null || true; \
+	done
+	@kubectl get nodes
+
+teardown: uncordon ## Remove demo app, Argo Application, and demo namespace
+	@kubectl delete application demo-app -n $(ARGOCD_NS) --ignore-not-found --wait=false
+	-$(call kustomize_delete,$(RELAXED_KUSTOMIZE))
+	-$(call kustomize_delete,$(STRICT_KUSTOMIZE))
+	@kubectl delete namespace $(NAMESPACE) --ignore-not-found --wait=false
+	@echo "Demo resources removed. kind cluster '$(CLUSTER_NAME)' is unchanged."
+
+clean: teardown cluster-delete ## Remove demo resources and delete kind cluster
+
+validate: ## Build all kustomize overlays (offline YAML check)
+	@kubectl kustomize $(RELAXED_KUSTOMIZE) $(KUSTOMIZE_FLAGS) >/dev/null
+	@kubectl kustomize $(STRICT_KUSTOMIZE) $(KUSTOMIZE_FLAGS) >/dev/null
+	@echo "All overlays build successfully."
+
+dry-run: validate ## Alias for validate
