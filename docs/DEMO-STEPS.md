@@ -44,40 +44,114 @@ make port-forward   # http://127.0.0.1:8888
 
 ## Quick demo — 3 concepts, ~10 minutes
 
-Fastest path through the demo. Run `make setup` first.
+Fastest path through the demo. Run `make setup` first (or see raw setup commands below).
+
+Each step shows the **make shortcut** and the **raw kubectl** equivalent.
+
+---
 
 ### 1. PVC persistence — data survives pod deletion
 
+**make shortcut**
 ```bash
-make status              # show pods + PVCs
-make evict               # evict one pod — PDB (relaxed) allows it
-make status              # pod rescheduled, PVC reattached, same data
+make status    # show pods + PVCs + node placement
+make evict     # evict one pod via Eviction API (relaxed PDB allows it)
+make status    # pod rescheduled, PVC reattached, same data
 ```
 
-**Point:** the pod restarted on a new node but the PVC followed it.
+**raw kubectl**
+```bash
+# Show cluster state
+kubectl get nodes -o wide
+kubectl get pods,pvc,pdb -n demo -o wide
+
+# Evict a pod via the Eviction API (HTTP 201 = allowed)
+kubectl create -f - <<'EOF'
+apiVersion: policy/v1
+kind: Eviction
+metadata:
+  name: demo-app-0
+  namespace: demo
+EOF
+
+# Watch recreation and PVC reattachment
+kubectl get pods,pvc -n demo -o wide
+```
+
+**Point:** the pod restarted (possibly on a new node) but the PVC followed it — data at `/data` is intact.
+
+---
 
 ### 2. PDB blocks eviction — switch to strict PDB
 
+**make shortcut**
 ```bash
-make pdb-strict          # minAvailable:2, ALLOWED DISRUPTIONS:0
-make evict               # Eviction API returns HTTP 429 — blocked
-make drain               # kubectl drain also blocked
-make pdb-relaxed         # restore — drain completes
-make uncordon
+make pdb-strict   # minAvailable: 2, ALLOWED DISRUPTIONS: 0 (2 replicas)
+make evict        # Eviction API returns HTTP 429 — blocked
+make drain        # kubectl drain also blocked by PDB
+make pdb-relaxed  # restore relaxed PDB
+make uncordon     # uncordon the node drained above
 ```
 
-**Point:** PDB is enforced by the Eviction API, not just a hint.
-
-### 3. Argo CD GitOps — push a manifest change, watch it sync
-
+**raw kubectl**
 ```bash
-# Edit manifests/k8s-demo/statefulset.yaml (e.g. change replicas: 3 → 2)
-git commit -am "demo: scale down" && git push
-# Open http://localhost:30080 — watch Argo CD detect drift and self-heal
-make status              # shows updated pod count
+# Switch to strict PDB (minAvailable: 2 → ALLOWED DISRUPTIONS: 0 with 2 replicas)
+kubectl kustomize manifests/k8s-demo/overlays/strict \
+  --load-restrictor LoadRestrictionsNone | kubectl apply -f -
+kubectl get pdb -n demo
+
+# Try to evict — HTTP 429: blocked by PDB
+kubectl create -f - <<'EOF'
+apiVersion: policy/v1
+kind: Eviction
+metadata:
+  name: demo-app-0
+  namespace: demo
+EOF
+# → error: Cannot evict pod as it would violate the pod's disruption budget
+
+# Try to drain — also blocked
+NODE=$(kubectl get pods -n demo demo-app-0 -o jsonpath='{.spec.nodeName}')
+kubectl cordon "$NODE"
+kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --grace-period=30 --timeout=60s
+
+# Restore: switch back to relaxed PDB and uncordon
+kubectl kustomize manifests/k8s-demo/overlays/relaxed \
+  --load-restrictor LoadRestrictionsNone | kubectl apply -f -
+kubectl uncordon "$NODE"
 ```
 
-**Point:** Argo CD continuously reconciles; manual `kubectl` changes get reverted.
+**Point:** PDB is enforced by the Eviction API, not just advisory — drain and evict both get a hard 429.
+
+---
+
+### 3. Argo CD GitOps — push a change, watch it sync
+
+**make shortcut**
+```bash
+# Edit manifests/k8s-demo/statefulset.yaml, then:
+git commit -am "demo: change replicas" && git push
+make status   # shows updated pod count after Argo CD syncs
+```
+
+**raw kubectl**
+```bash
+# Edit the manifest (e.g. change replicas: 2 → 1)
+vi manifests/k8s-demo/statefulset.yaml
+
+# Push to git — Argo CD watches this repo
+git add manifests/k8s-demo/statefulset.yaml
+git commit -m "demo: scale replicas"
+git push
+
+# Watch Argo CD detect drift and reconcile (~30-60 s)
+kubectl get application demo-app -n argocd -w
+kubectl get pods -n demo -w
+
+# Open http://localhost:30080 → demo-app → watch the sync animation
+```
+
+**Point:** Argo CD continuously reconciles; a manual `kubectl scale` would be reverted within ~3 minutes.
 
 ---
 

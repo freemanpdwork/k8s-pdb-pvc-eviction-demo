@@ -28,7 +28,14 @@ KUSTOMIZE_FLAGS   := --load-restrictor LoadRestrictionsNone
 kustomize_apply = kubectl kustomize $(1) $(KUSTOMIZE_FLAGS) | kubectl apply -f -
 kustomize_delete = kubectl kustomize $(1) $(KUSTOMIZE_FLAGS) | kubectl delete -f - --ignore-not-found
 
-.PHONY: help setup cluster cluster-delete check-cluster fix-context argocd argocd-expose argocd-password argocd-app argocd-wait \
+# Terminal styling (bold-cyan headers, dim command hints, bold-yellow notes)
+FMT_H     := \033[1;36m
+FMT_C     := \033[2m
+FMT_W     := \033[1;33m
+FMT_RESET := \033[0m
+
+.PHONY: help setup cluster cluster-delete check-cluster fix-context guard-context \
+        argocd argocd-expose argocd-password argocd-app argocd-wait \
         port-forward argocd-proxy deploy deploy-direct deploy-strict pdb-relaxed pdb-strict \
         demo-data wait-ready status logs evict drain uncordon teardown clean \
         dry-run validate
@@ -73,7 +80,23 @@ cluster-delete: ## Delete kind cluster and local kubeconfig
 	fi
 	@rm -f $(KUBECONFIG_FILE)
 
-check-cluster: ## Verify kind cluster is reachable and nodes are ready
+guard-context: ## Abort if kubectl context is not a known local cluster (kind or Docker Desktop)
+	@if [[ "$${SKIP_GUARD:-}" == "1" ]]; then exit 0; fi; \
+	if [[ "$${KUBECONFIG:-}" == "$(KUBECONFIG_FILE)" ]]; then exit 0; fi; \
+	ctx=$$(kubectl config current-context 2>/dev/null || echo ""); \
+	case "$$ctx" in \
+		kind-$(CLUSTER_NAME)|docker-desktop|docker-for-desktop) \
+			true;; \
+		*) \
+			printf '\n\033[1;31mSAFETY ABORT\033[0m: kubectl context is '"'"'%s'"'"'\n' "$$ctx" >&2; \
+			echo "This Makefile targets local demo clusters only (kind or Docker Desktop)." >&2; \
+			echo "Safe contexts: kind-$(CLUSTER_NAME), docker-desktop, docker-for-desktop" >&2; \
+			echo "Override (dangerous): SKIP_GUARD=1 make <target>" >&2; \
+			echo "" >&2; \
+			exit 1;; \
+	esac
+
+check-cluster: guard-context ## Verify kind cluster is reachable and nodes are ready
 	@command -v kubectl >/dev/null || { echo "kubectl is required but not installed." >&2; exit 1; }
 	@command -v kind >/dev/null || { echo "kind is required. Install: https://kind.sigs.k8s.io/" >&2; exit 1; }
 	@if [[ ! -f "$(KUBECONFIG_FILE)" ]]; then \
@@ -148,7 +171,7 @@ fix-context: ## Fix empty/wrong kubectl context (kind or Docker Desktop)
 		fi; \
 	fi
 	@echo "Available contexts:"
-	kubectl config get-contexts || true
+	@kubectl config get-contexts || true
 	@echo ""
 	@if [[ -f "$(KUBECONFIG_FILE)" ]]; then \
 		export KUBECONFIG="$(KUBECONFIG_FILE)"; \
@@ -177,7 +200,7 @@ fix-context: ## Fix empty/wrong kubectl context (kind or Docker Desktop)
 	fi
 	@echo ""
 	@echo "Verifying cluster access..."
-	kubectl get nodes || { \
+	@kubectl get nodes || { \
 		echo "Cluster unreachable." >&2; \
 		echo "kind: make cluster && export KUBECONFIG=$(KUBECONFIG_FILE)" >&2; \
 		echo "Docker Desktop: enable Kubernetes and wait for it to start." >&2; \
@@ -186,36 +209,39 @@ fix-context: ## Fix empty/wrong kubectl context (kind or Docker Desktop)
 	}
 
 argocd: check-cluster ## Install Argo CD and wait for server ready
-	kubectl get namespace $(ARGOCD_NS) >/dev/null 2>&1 || kubectl create namespace $(ARGOCD_NS)
-	kubectl apply --server-side --force-conflicts -n $(ARGOCD_NS) -f $(ARGOCD_INSTALL)
-	@echo "Applying local demo config (anonymous admin, insecure HTTP)..."
-	kubectl apply -n $(ARGOCD_NS) -f manifests/argocd/insecure-anonymous.yaml
-	kubectl rollout restart deployment/argocd-server -n $(ARGOCD_NS)
-	kubectl rollout restart deployment/argocd-repo-server -n $(ARGOCD_NS)
-	@echo "Waiting for argocd-server..."
-	kubectl rollout status deployment/argocd-server -n $(ARGOCD_NS) --timeout=300s
-	kubectl rollout status deployment/argocd-repo-server -n $(ARGOCD_NS) --timeout=300s
-	kubectl rollout status deployment/argocd-applicationset-controller -n $(ARGOCD_NS) --timeout=300s 2>/dev/null || true
+	@kubectl get namespace $(ARGOCD_NS) >/dev/null 2>&1 || kubectl create namespace $(ARGOCD_NS)
+	@printf '$(FMT_H)Installing Argo CD...$(FMT_RESET)\n'
+	@printf '$(FMT_C)  $ kubectl apply --server-side -n $(ARGOCD_NS) -f <install.yaml>$(FMT_RESET)\n'
+	@kubectl apply --server-side --force-conflicts -n $(ARGOCD_NS) -f $(ARGOCD_INSTALL)
+	@printf '$(FMT_H)Applying demo config (anonymous admin, insecure HTTP)...$(FMT_RESET)\n'
+	@printf '$(FMT_C)  $ kubectl apply -n $(ARGOCD_NS) -f manifests/argocd/insecure-anonymous.yaml$(FMT_RESET)\n'
+	@kubectl apply -n $(ARGOCD_NS) -f manifests/argocd/insecure-anonymous.yaml
+	@kubectl rollout restart deployment/argocd-server -n $(ARGOCD_NS)
+	@kubectl rollout restart deployment/argocd-repo-server -n $(ARGOCD_NS)
+	@printf '$(FMT_H)Waiting for argocd-server rollout...$(FMT_RESET)\n'
+	@kubectl rollout status deployment/argocd-server -n $(ARGOCD_NS) --timeout=300s
+	@kubectl rollout status deployment/argocd-repo-server -n $(ARGOCD_NS) --timeout=300s
+	@kubectl rollout status deployment/argocd-applicationset-controller -n $(ARGOCD_NS) --timeout=300s 2>/dev/null || true
 	@$(MAKE) argocd-expose
 
 argocd-expose: check-cluster ## Expose Argo CD UI via NodePort (ARGOCD_NODE_PORT, default 30080)
 	@echo "Waiting for argocd-server pod to be Ready..."
-	kubectl wait --for=condition=Ready pod \
+	@kubectl wait --for=condition=Ready pod \
 		-l app.kubernetes.io/name=argocd-server -n $(ARGOCD_NS) --timeout=120s
-	sed 's/nodePort: 30080/nodePort: $(ARGOCD_NODE_PORT)/' manifests/argocd/nodeport-patch.yaml | \
+	@sed 's/nodePort: 30080/nodePort: $(ARGOCD_NODE_PORT)/' manifests/argocd/nodeport-patch.yaml | \
 		kubectl apply -f -
 	@echo ""
-	@echo "Argo CD UI (preferred on kind/Mac): http://localhost:$(ARGOCD_NODE_PORT)"
-	@echo "No login required. Fallback tunnels: make port-forward or make argocd-proxy"
+	@printf '$(FMT_H)Argo CD UI:$(FMT_RESET) http://localhost:$(ARGOCD_NODE_PORT)  (no login required)\n'
+	@echo "Fallback tunnels: make port-forward  or  make argocd-proxy"
 	@echo "Note: existing clusters need 'make cluster-delete && make cluster' for host port mapping"
 
 argocd-password: ## Print initial Argo CD admin password
-	kubectl -n $(ARGOCD_NS) get secret argocd-initial-admin-secret \
+	@kubectl -n $(ARGOCD_NS) get secret argocd-initial-admin-secret \
 		-o jsonpath='{.data.password}' 2>/dev/null | base64 -d; echo
 
 port-forward: check-cluster ## Port-forward Argo CD UI (fallback; prefer make argocd-expose on kind)
 	@echo "Waiting for argocd-server pod to be Ready..."
-	kubectl wait --for=condition=Ready pod \
+	@kubectl wait --for=condition=Ready pod \
 		-l app.kubernetes.io/name=argocd-server -n $(ARGOCD_NS) --timeout=120s
 	@if command -v lsof >/dev/null 2>&1 && \
 		lsof -iTCP:$(ARGOCD_LOCAL_PORT) -sTCP:LISTEN -t >/dev/null 2>&1; then \
@@ -227,31 +253,34 @@ port-forward: check-cluster ## Port-forward Argo CD UI (fallback; prefer make ar
 	@echo "Prefer direct access on kind: make argocd-expose → http://localhost:$(ARGOCD_NODE_PORT)"
 	@echo "Open http://127.0.0.1:$(ARGOCD_LOCAL_PORT) (Ctrl+C to stop)"
 	@echo "If connection resets, use: make argocd-expose or make argocd-proxy"
-	kubectl port-forward deployment/argocd-server -n $(ARGOCD_NS) \
+	@kubectl port-forward deployment/argocd-server -n $(ARGOCD_NS) \
 		--address 127.0.0.1 $(ARGOCD_LOCAL_PORT):8080
 
 argocd-proxy: check-cluster ## kubectl proxy to Argo CD UI (fallback; prefer make argocd-expose on kind)
 	@echo "Waiting for argocd-server pod to be Ready..."
-	kubectl wait --for=condition=Ready pod \
+	@kubectl wait --for=condition=Ready pod \
 		-l app.kubernetes.io/name=argocd-server -n $(ARGOCD_NS) --timeout=120s
 	@echo "Prefer direct access on kind: make argocd-expose → http://localhost:$(ARGOCD_NODE_PORT)"
 	@echo "Open (leave this running):"
 	@echo "  http://127.0.0.1:$(ARGOCD_PROXY_PORT)/api/v1/namespaces/$(ARGOCD_NS)/services/http:argocd-server:80/proxy/"
-	kubectl proxy --port=$(ARGOCD_PROXY_PORT) --address=127.0.0.1
+	@kubectl proxy --port=$(ARGOCD_PROXY_PORT) --address=127.0.0.1
 
 deploy: deploy-direct ## Apply relaxed overlay via kubectl (works offline)
-deploy-direct: ## kubectl apply relaxed overlay (no Argo CD required)
-	$(call kustomize_apply,$(RELAXED_KUSTOMIZE))
+deploy-direct: guard-context ## kubectl apply relaxed overlay (no Argo CD required)
+	@printf '$(FMT_C)  $ kubectl kustomize $(RELAXED_KUSTOMIZE) | kubectl apply -f -$(FMT_RESET)\n'
+	@$(call kustomize_apply,$(RELAXED_KUSTOMIZE))
 	@$(MAKE) wait-ready
 
-deploy-strict: ## Apply strict PDB overlay via kubectl
-	$(call kustomize_apply,$(STRICT_KUSTOMIZE))
+deploy-strict: guard-context ## Apply strict PDB overlay via kubectl
+	@printf '$(FMT_C)  $ kubectl kustomize $(STRICT_KUSTOMIZE) | kubectl apply -f -$(FMT_RESET)\n'
+	@$(call kustomize_apply,$(STRICT_KUSTOMIZE))
 	@$(MAKE) wait-ready
 
 argocd-app: ## Register Argo CD Application and wait until Synced/Healthy
-	sed 's|DEMO_REPO_URL_PLACEHOLDER|$(DEMO_REPO_URL)|g' manifests/argocd/application.yaml | \
+	@printf '$(FMT_C)  $ kubectl apply (argocd/application.yaml → repoURL=$(DEMO_REPO_URL))$(FMT_RESET)\n'
+	@sed 's|DEMO_REPO_URL_PLACEHOLDER|$(DEMO_REPO_URL)|g' manifests/argocd/application.yaml | \
 		kubectl apply --server-side --force-conflicts -f -
-	@echo "Argo CD Application applied. repoURL=$(DEMO_REPO_URL)"
+	@echo "Argo CD Application registered. repoURL=$(DEMO_REPO_URL)"
 	@$(MAKE) argocd-wait
 
 argocd-wait: check-cluster ## Wait for demo-app Application Synced and Healthy in Argo CD
@@ -272,35 +301,44 @@ argocd-wait: check-cluster ## Wait for demo-app Application Synced and Healthy i
 	}
 	@echo "demo-app is Synced and Healthy."
 
-pdb-relaxed: ## Switch to relaxed PDB (minAvailable: 1)
-	$(call kustomize_apply,$(RELAXED_KUSTOMIZE))
-	kubectl get pdb -n $(NAMESPACE)
+pdb-relaxed: guard-context ## Switch to relaxed PDB (minAvailable: 1)
+	@printf '$(FMT_C)  $ kubectl kustomize $(RELAXED_KUSTOMIZE) | kubectl apply -f -$(FMT_RESET)\n'
+	@$(call kustomize_apply,$(RELAXED_KUSTOMIZE))
+	@printf '$(FMT_C)  $ kubectl get pdb -n $(NAMESPACE)$(FMT_RESET)\n'
+	@kubectl get pdb -n $(NAMESPACE)
 
-pdb-strict: ## Switch to strict PDB (minAvailable: 2) — blocks eviction/drain
-	$(call kustomize_apply,$(STRICT_KUSTOMIZE))
-	kubectl get pdb -n $(NAMESPACE)
-	@echo "Strict PDB active: voluntary eviction of any pod should be blocked."
+pdb-strict: guard-context ## Switch to strict PDB (minAvailable: 2) — blocks eviction/drain
+	@printf '$(FMT_C)  $ kubectl kustomize $(STRICT_KUSTOMIZE) | kubectl apply -f -$(FMT_RESET)\n'
+	@$(call kustomize_apply,$(STRICT_KUSTOMIZE))
+	@printf '$(FMT_C)  $ kubectl get pdb -n $(NAMESPACE)$(FMT_RESET)\n'
+	@kubectl get pdb -n $(NAMESPACE)
+	@printf '$(FMT_W)Strict PDB active (minAvailable: 2). ALLOWED DISRUPTIONS=0 when 2 replicas are running — eviction and drain will be blocked.$(FMT_RESET)\n'
 
-demo-data: wait-ready ## Write unique marker files to each pod's PVC at /data
+demo-data: guard-context wait-ready ## Write unique marker files to each pod's PVC at /data
 	@./scripts/write-data.sh
 
 wait-ready: ## Wait for StatefulSet, pods, PVCs, and PDB
 	@./scripts/wait-ready.sh
 
 status: ## Show pods, PVCs, PDB, and node placement
-	@echo "=== Nodes ==="
-	kubectl get nodes -o wide
+	@printf '$(FMT_H)=== Nodes ===\n$(FMT_RESET)'
+	@printf '$(FMT_C)  $ kubectl get nodes -o wide$(FMT_RESET)\n'
+	@kubectl get nodes -o wide
 	@echo ""
-	@echo "=== demo namespace ==="
-	kubectl get pods,pvc,pdb,svc -n $(NAMESPACE) -o wide 2>/dev/null || \
+	@printf '$(FMT_H)=== demo namespace ===\n$(FMT_RESET)'
+	@printf '$(FMT_C)  $ kubectl get pods,pvc,pdb,svc -n $(NAMESPACE) -o wide$(FMT_RESET)\n'
+	@kubectl get pods,pvc,pdb,svc -n $(NAMESPACE) -o wide 2>/dev/null || \
 		echo "Namespace $(NAMESPACE) not found — run 'make deploy'"
 	@echo ""
-	@echo "=== Argo CD Application ==="
-	kubectl get application demo-app -n $(ARGOCD_NS) 2>/dev/null || \
+	@printf '$(FMT_H)=== Argo CD Application ===\n$(FMT_RESET)'
+	@printf '$(FMT_C)  $ kubectl get application demo-app -n $(ARGOCD_NS)$(FMT_RESET)\n'
+	@kubectl get application demo-app -n $(ARGOCD_NS) 2>/dev/null || \
 		echo "(no Argo CD Application — run 'make argocd-app' or 'make setup')"
+	@echo ""
 
 logs: ## Tail logs from demo-app pods
-	kubectl logs -n $(NAMESPACE) -l app=demo-app --tail=50 --prefix=true
+	@printf '$(FMT_C)  $ kubectl logs -n $(NAMESPACE) -l app=demo-app --tail=50 --prefix=true$(FMT_RESET)\n'
+	@kubectl logs -n $(NAMESPACE) -l app=demo-app --tail=50 --prefix=true
 
 evict: ## Evict one demo pod (shows PDB allow/block)
 	@./scripts/evict-pod.sh
@@ -312,20 +350,22 @@ uncordon: ## Uncordon all nodes (post-drain cleanup)
 	@for node in $$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do \
 		kubectl uncordon "$$node" 2>/dev/null || true; \
 	done
-	kubectl get nodes
+	@printf '$(FMT_C)  $ kubectl get nodes$(FMT_RESET)\n'
+	@kubectl get nodes
 
-teardown: uncordon ## Remove demo app, Argo Application, and demo namespace
-	kubectl delete application demo-app -n $(ARGOCD_NS) --ignore-not-found --wait=false
-	-$(call kustomize_delete,$(RELAXED_KUSTOMIZE))
-	-$(call kustomize_delete,$(STRICT_KUSTOMIZE))
-	kubectl delete namespace $(NAMESPACE) --ignore-not-found --wait=false
+teardown: guard-context uncordon ## Remove demo app, Argo Application, and demo namespace
+	@printf '$(FMT_H)Removing demo resources...$(FMT_RESET)\n'
+	@kubectl delete application demo-app -n $(ARGOCD_NS) --ignore-not-found --wait=false
+	@-$(call kustomize_delete,$(RELAXED_KUSTOMIZE))
+	@-$(call kustomize_delete,$(STRICT_KUSTOMIZE))
+	@kubectl delete namespace $(NAMESPACE) --ignore-not-found --wait=false
 	@echo "Demo resources removed. kind cluster '$(CLUSTER_NAME)' is unchanged."
 
 clean: teardown cluster-delete ## Remove demo resources and delete kind cluster
 
 validate: ## Build all kustomize overlays (offline YAML check)
-	kubectl kustomize $(RELAXED_KUSTOMIZE) $(KUSTOMIZE_FLAGS) >/dev/null
-	kubectl kustomize $(STRICT_KUSTOMIZE) $(KUSTOMIZE_FLAGS) >/dev/null
-	@echo "All overlays build successfully."
+	@kubectl kustomize $(RELAXED_KUSTOMIZE) $(KUSTOMIZE_FLAGS) >/dev/null
+	@kubectl kustomize $(STRICT_KUSTOMIZE) $(KUSTOMIZE_FLAGS) >/dev/null
+	@printf '$(FMT_H)All overlays build successfully.$(FMT_RESET)\n'
 
 dry-run: validate ## Alias for validate
