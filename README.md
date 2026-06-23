@@ -1,5 +1,5 @@
 # k8s PDB + PVC + Eviction Demo
-##
+###
 Hands-on demo of **PodDisruptionBudgets**, **PVC-backed StatefulSets**, voluntary **eviction**, node **drain**, and **Argo CD GitOps** on a local **kind** cluster (3 nodes: 1 control-plane + 2 workers).
 
 ## Prerequisites
