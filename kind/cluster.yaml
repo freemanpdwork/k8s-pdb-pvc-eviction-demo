@@ -1,4 +1,4 @@
-# 3-node local cluster for PDB + PVC + drain demo (1 control-plane + 2 workers).
+# 4-node local cluster for PDB + PVC + drain demo (1 control-plane + 3 workers).
 #
 # Create with:
 #   make cluster
@@ -16,5 +16,6 @@ nodes:
       - containerPort: 30090
         hostPort: 30090
         protocol: TCP
+  - role: worker
   - role: worker
   - role: worker

@@ -1,5 +1,5 @@
 # k8s PDB + PVC + eviction demo — primary UX entrypoint
-# Uses kind (3 nodes: 1 control-plane + 2 workers). See README.md for Docker Desktop fallback.
+# Uses kind (4 nodes: 1 control-plane + 3 workers). See README.md for Docker Desktop fallback.
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
@@ -144,10 +144,10 @@ check-cluster: guard-context ## Verify kind cluster is reachable and nodes are r
 	worker_count=$$(kubectl get nodes --no-headers -l '!node-role.kubernetes.io/control-plane' 2>/dev/null | wc -l | tr -d ' '); \
 	echo "Nodes: $$node_count ($$worker_count worker(s))"; \
 	kubectl get nodes -o wide; \
-	if [[ "$$worker_count" -lt 2 ]]; then \
+	if [[ "$$worker_count" -lt 3 ]]; then \
 		echo ""; \
-		echo "WARNING: fewer than 2 workers — pod spread and drain demos work best with 2 workers."; \
-		echo "  Expected: make cluster (uses $(KIND_CONFIG): 1 control-plane + 2 workers)"; \
+		echo "WARNING: fewer than 3 workers — pod spread and drain demos work best with 3 workers."; \
+		echo "  Expected: make cluster (uses $(KIND_CONFIG): 1 control-plane + 3 workers)"; \
 		echo "  Eviction/PDB behavior still works; pods may land on the same node."; \
 	fi
 

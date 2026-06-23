@@ -17,7 +17,7 @@ It is not production code. Correctness of the demo UX matters more than generali
 | Cluster name | `pdb-pvc-demo` |
 | kubectl context | `kind-pdb-pvc-demo` |
 | Kubeconfig | `.kube/kind-pdb-pvc-demo` (auto-exported by Makefile if present) |
-| Nodes | `pdb-pvc-demo-control-plane`, `pdb-pvc-demo-worker`, `pdb-pvc-demo-worker2` |
+| Nodes | 1 control-plane + 3 workers (`pdb-pvc-demo-worker`, `pdb-pvc-demo-worker2`, `pdb-pvc-demo-worker3`) |
 | Kubernetes version | v1.34.0 |
 
 ## Demo resources

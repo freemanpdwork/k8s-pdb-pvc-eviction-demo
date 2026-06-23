@@ -4,7 +4,7 @@
 
 **Audience:** Platform / SRE engineers  
 **Duration:** ~45–60 minutes (or ~10 minutes with the quick demo below)  
-**Cluster:** kind (`kind-pdb-pvc-demo` context, 1 control-plane + 2 workers)
+**Cluster:** kind (`kind-pdb-pvc-demo` context, 1 control-plane + 3 workers)
 
 ---
 
@@ -12,8 +12,11 @@
 
 For a focused audience or tight timeslot. For the full 45-minute version with k9s walkthroughs and drift detection, see [Acts 1–8](#act-1--cluster--argo-cd-5-min) below.
 
+Each step shows the **make shortcut** and the **raw kubectl** equivalent.
+
 ### Setup (before the room, ~2 min)
 
+**make shortcut**
 ```bash
 make setup           # cluster + Argo CD + GitOps sync + demo data
 ```
@@ -24,6 +27,12 @@ In a second terminal, start the HTTP endpoint — leave it running throughout th
 make demo-url        # → http://localhost:8090/  (nginx serves PVC data)
 ```
 
+**raw kubectl**
+```bash
+# Port-forward the ClusterIP HTTP service manually
+kubectl port-forward svc/demo-app-http -n demo 8090:80
+```
+
 Open **http://localhost:8090/** in a browser. It shows which pod served the request, which PVC is mounted, which node the pod is on, and when the data was last written. This page is the visual anchor for the next two concepts.
 
 ---
@@ -32,22 +41,45 @@ Open **http://localhost:8090/** in a browser. It shows which pod served the requ
 
 **Talking point:** The PVC is not the pod. Data at `/data` lives on a persistent volume; the pod is just a consumer. Evict the pod, reschedule it — same data comes back.
 
+**make shortcut**
 ```bash
 make status          # pods on separate nodes, PVCs Bound, PDB relaxed
 make demo-data       # write marker.txt + index.html to each pod's /data
 ```
 
+**raw kubectl**
+```bash
+kubectl get nodes -o wide
+kubectl get pods,pvc,pdb -n demo -o wide
+
+# Write marker data to each pod's PVC
+kubectl exec -n demo demo-app-0 -- cat /data/marker.txt   # verify data exists
+```
+
 Refresh **http://localhost:8090/** — note the pod name, node, and write timestamp.
 
+**make shortcut**
 ```bash
 make evict           # Eviction API → HTTP 201 Created (relaxed PDB allows it)
 ```
 
-Refresh **http://localhost:8090/** — same write timestamp, possibly a different node listed. The PVC followed the pod.
-
+**raw kubectl**
 ```bash
-curl http://localhost:8090/marker.txt   # confirm same content as before eviction
+# Eviction is a pod subresource — use kubectl proxy + curl
+kubectl proxy --port=38001 &
+curl -s -w "\nHTTP %{http_code}\n" -X POST \
+  http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"demo-app-0","namespace":"demo"}}'
+kill %1
+# → HTTP 201 Created (eviction allowed)
+
+# Verify pod rescheduled and PVC reattached
+kubectl get pods,pvc -n demo -o wide
+kubectl exec -n demo demo-app-0 -- cat /data/marker.txt
 ```
+
+Refresh **http://localhost:8090/** — same write timestamp, possibly a different node listed. The PVC followed the pod.
 
 **Key point:** the browser tab never needed to know the pod moved. The PVC reattached automatically.
 
@@ -57,23 +89,60 @@ curl http://localhost:8090/marker.txt   # confirm same content as before evictio
 
 **Talking point:** PodDisruptionBudget is not advisory — it gates the Eviction API directly. When no disruptions are allowed, the API returns HTTP 429. `kubectl drain` uses the same API, so drain is also blocked.
 
+**make shortcut**
 ```bash
 make pdb-strict      # minAvailable: 2, ALLOWED DISRUPTIONS: 0 with 2 replicas
 make evict           # Eviction API → HTTP 429 Too Many Requests — pod NOT deleted
 ```
 
+**raw kubectl**
+```bash
+# Switch to strict PDB (minAvailable: 2 → ALLOWED DISRUPTIONS: 0 with 2 replicas)
+kubectl kustomize manifests/k8s-demo/overlays/strict \
+  --load-restrictor LoadRestrictionsNone | kubectl apply -f -
+kubectl get pdb -n demo
+
+# Try to evict — HTTP 429: blocked by PDB
+kubectl proxy --port=38001 &
+curl -s -w "\nHTTP %{http_code}\n" -X POST \
+  http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"demo-app-0","namespace":"demo"}}'
+kill %1
+# → HTTP 429 Too Many Requests (PDB blocked it)
+```
+
 Show the 429 output from the terminal. Refresh **http://localhost:8090/** — still showing the original pod (unchanged).
 
+**make shortcut**
 ```bash
 make drain           # cordon + drain a worker — drain also blocked by PDB
 make status          # node cordoned (SchedulingDisabled), pods untouched
 ```
 
+**raw kubectl**
+```bash
+# Try to drain — also blocked by PDB
+NODE=$(kubectl get pods -n demo demo-app-0 -o jsonpath='{.spec.nodeName}')
+kubectl cordon "$NODE"
+kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --grace-period=30 --timeout=60s
+kubectl get nodes   # NODE shows SchedulingDisabled; pods untouched
+```
+
 Restore:
 
+**make shortcut**
 ```bash
 make pdb-relaxed     # restore 1 allowed disruption
 make uncordon        # restore cordoned node
+```
+
+**raw kubectl**
+```bash
+kubectl kustomize manifests/k8s-demo/overlays/relaxed \
+  --load-restrictor LoadRestrictionsNone | kubectl apply -f -
+kubectl uncordon "$NODE"
+kubectl get pdb -n demo   # ALLOWED DISRUPTIONS: 1
 ```
 
 **Key point:** PDB enforcement is at the API layer, not the scheduler — there's no way to "accidentally" evict past a budget.
@@ -84,18 +153,41 @@ make uncordon        # restore cordoned node
 
 **Talking point:** Desired state lives in git. Argo CD continuously reconciles — manual `kubectl` changes are drift and get reverted.
 
+**make shortcut**
 ```bash
 # Edit manifests/k8s-demo/statefulset.yaml (e.g. add a label or env var)
 git commit -am "demo: change something visible" && git push
+make status          # cluster now matches git
+```
+
+**raw kubectl**
+```bash
+# Edit the manifest
+vi manifests/k8s-demo/statefulset.yaml
+
+# Push to git — Argo CD watches this repo
+git add manifests/k8s-demo/statefulset.yaml
+git commit -m "demo: change something visible"
+git push
+
+# Watch Argo CD detect drift and reconcile (~30-60 s)
+kubectl get application demo-app -n argocd -w
+kubectl get pods -n demo -w
+
+# Verify cluster matches git
+kubectl get pods,pvc -n demo -o wide
 ```
 
 Open **http://localhost:30080** (Argo CD UI, no login) — watch the Application go OutOfSync → Syncing → Synced.
 
-```bash
-make status          # cluster now matches git
-```
+Bonus: make a manual kubectl change — Argo CD reverts it within ~3 minutes (selfHeal):
 
-Bonus: make a manual `kubectl label` change — Argo CD reverts it within ~3 minutes (selfHeal).
+```bash
+kubectl label pod -n demo demo-app-0 drift=manual --overwrite
+kubectl get pod -n demo demo-app-0 --show-labels   # label present
+# wait ~3 minutes or force sync from the Argo CD UI
+kubectl get pod -n demo demo-app-0 --show-labels   # label gone
+```
 
 **Key point:** GitOps means the cluster is always a function of git. Drift is detected and healed automatically.
 
@@ -165,7 +257,7 @@ make argocd-app    # applies local manifests/argocd/application.yaml (not from g
 
 ### Multi-node kind cluster
 
-`make cluster` creates **1 control-plane + 2 workers** (`kind/cluster.yaml`). That gives you:
+`make cluster` creates **1 control-plane + 3 workers** (`kind/cluster.yaml`). That gives you:
 
 - **Pod spread** — StatefulSet pod anti-affinity prefers different workers; `make status` should show `demo-app-0` and `demo-app-1` on separate nodes.
 - **Drain demo (Act 7)** — cordon and drain a worker that runs one demo pod; strict PDB blocks eviction; relaxed PDB allows one pod to move while the other stays on the second worker.
@@ -186,7 +278,7 @@ kubectl get nodes -o wide
 make demo-url       # → http://localhost:8090/  (PVC data served by nginx)
 ```
 
-**Expected:** 3 nodes (1 control-plane + 2 workers), all `Ready`. Argo CD pods Running in `argocd` namespace. Context `kind-pdb-pvc-demo`. Argo CD UI at http://localhost:30080 — open in browser, no login. Application `demo-app` already **Synced / Healthy** in the dashboard.
+**Expected:** 4 nodes (1 control-plane + 3 workers), all `Ready`. Argo CD pods Running in `argocd` namespace. Context `kind-pdb-pvc-demo`. Argo CD UI at http://localhost:30080 — open in browser, no login. Application `demo-app` already **Synced / Healthy** in the dashboard.
 
 **k9s:** `:nodes`, then `:applications argocd` — `demo-app` is listed
 
@@ -327,7 +419,7 @@ make evict
 
 **Talking points:** `kubectl drain` uses the eviction API for each pod. PDB blocks the whole drain when no disruptions are allowed.
 
-With **2 workers**, drain the worker running a demo pod — the other worker still has a pod, but strict PDB prevents evicting either one, so drain fails as expected.
+With **3 workers**, drain the worker running a demo pod — with strict PDB (`ALLOWED DISRUPTIONS: 0`) the eviction is refused. With relaxed PDB the pod migrates to an idle worker, making the node migration clearly visible.
 
 ```bash
 make drain
@@ -405,7 +497,7 @@ make cluster-delete # delete kind cluster only
 | Argo CD login prompt | Re-run `make argocd` to apply `insecure-anonymous.yaml`; UI should need no credentials |
 | PVC Pending | `kubectl get sc` — kind default is `standard` (local-path) |
 | Pods on same node | Delete pods once: `kubectl delete pod -n demo -l app=demo-app`; or check worker count with `kubectl get nodes` |
-| Fewer than 2 workers | Recreate: `make clean && make cluster` |
+| Fewer than 3 workers | Recreate: `make clean && make cluster` |
 | Argo Sync **Unknown** / `ComparisonError` (kustomize load restrictor) | Default Application path is `manifests/k8s-demo` (no `../../`). For `overlays/strict`, run `make argocd` first (global `kustomize.buildOptions` on repo-server), then change Application path and `make argocd-app` |
 | Argo OutOfSync | Push manifests to `DEMO_REPO_URL` (see `make argocd-app` output); override with `DEMO_REPO_URL` for your fork; or `make deploy-direct` offline |
 | Argo sync timeout on setup | Ensure repo is reachable and `manifests/k8s-demo` exists at `DEMO_REPO_URL`; fallback: `make deploy-direct` |

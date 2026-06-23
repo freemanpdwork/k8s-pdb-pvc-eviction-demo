@@ -10,7 +10,7 @@ Condensed speaker reference for live demos. Full narrative, timing, and troubles
 | Pods | `demo-app-0`, `demo-app-1` |
 | PVCs | `data-demo-app-0`, `data-demo-app-1` (1Gi RWO, `/data`) |
 | PDB | `demo-app-pdb` |
-| Workers | `pdb-pvc-demo-worker`, `pdb-pvc-demo-worker2` |
+| Workers | `pdb-pvc-demo-worker`, `pdb-pvc-demo-worker2`, `pdb-pvc-demo-worker3` |
 | GitOps path | `manifests/k8s-demo` (relaxed) · `manifests/k8s-demo/overlays/strict` (strict) |
 
 ---
@@ -32,13 +32,13 @@ make port-forward   # http://127.0.0.1:8888
 | Step | Command | Notes |
 |------|---------|-------|
 | Bootstrap | `make setup` | Registers `demo-app` Application; waits Synced/Healthy |
-| Verify | `make check-cluster` | 1 control-plane + 2 workers Ready |
+| Verify | `make check-cluster` | 1 control-plane + 3 workers Ready |
 | Snapshot | `make status` | `demo-app-0` / `demo-app-1` on separate workers |
 | Argo CD UI | http://localhost:30080 | After `make argocd` / `make setup` — no login; `make argocd-expose` to re-apply |
 | Argo CD fallback | `make port-forward` | Second terminal — tunnel; can reset on kind/Mac |
 | Optional | `k9s` | `:nodes`, `:applications argocd`, `:pods demo` |
 
-**Expected:** Application `demo-app` **Synced / Healthy**; two pods **Running** on `pdb-pvc-demo-worker` and `pdb-pvc-demo-worker2`; PVCs `data-demo-app-0` and `data-demo-app-1` **Bound**.
+**Expected:** Application `demo-app` **Synced / Healthy**; two pods **Running** on separate workers (e.g. `pdb-pvc-demo-worker` and `pdb-pvc-demo-worker2`); PVCs `data-demo-app-0` and `data-demo-app-1` **Bound**.
 
 ---
 
@@ -246,7 +246,7 @@ make status
 | `:pods demo` | Show `demo-app-0` / `demo-app-1` on different workers |
 | `:pvc demo` | `data-demo-app-0`, `data-demo-app-1` — status Bound |
 
-**Expected:** 3 nodes Ready; Argo CD Application `demo-app` Synced/Healthy; two pods Running on separate workers (`pdb-pvc-demo-worker`, `pdb-pvc-demo-worker2`); PVCs Bound.
+**Expected:** 4 nodes Ready (1 control-plane + 3 workers); Argo CD Application `demo-app` Synced/Healthy; two pods Running on separate workers; PVCs Bound.
 
 ---
 
@@ -447,7 +447,7 @@ kubectl get pods -n demo -o wide
 | `:pdb demo` | Strict: ALLOWED DISRUPTIONS `0` during failed drain |
 | `:events demo` | PodDisruptionBudget events |
 
-**Expected (strict):** Worker cordoned (`SchedulingDisabled`); drain fails or times out; demo pod on `pdb-pvc-demo-worker2` keeps running; events mention PodDisruptionBudget.
+**Expected (strict):** Worker cordoned (`SchedulingDisabled`); drain fails or times out; demo pods on the remaining workers keep running; events mention PodDisruptionBudget.
 
 **Expected (relaxed):** One pod evicts from cordoned worker and reschedules on the other; PVC rebinds; drain completes for demo pods.
 
