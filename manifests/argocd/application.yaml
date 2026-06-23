@@ -11,8 +11,8 @@ spec:
   project: default
   source:
     repoURL: DEMO_REPO_URL_PLACEHOLDER
-    targetRevision: HEAD
-    path: manifests/k8s-demo/overlays/relaxed
+    targetRevision: main
+    path: manifests/k8s-demo
   destination:
     server: https://kubernetes.default.svc
     namespace: demo

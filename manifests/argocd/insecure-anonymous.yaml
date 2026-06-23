@@ -28,3 +28,4 @@ metadata:
     app.kubernetes.io/part-of: argocd
 data:
   server.insecure: "true"
+  kustomize.buildOptions: --load-restrictor LoadRestrictionsNone

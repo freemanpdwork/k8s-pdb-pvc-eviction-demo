@@ -1,5 +1,7 @@
 # Demo script: PDB, PVC, Eviction & GitOps
 
+**Command cheat sheet:** [DEMO-STEPS.md](DEMO-STEPS.md) — copy-paste kubectl commands, k9s views, and Makefile shortcuts for live demos.
+
 **Audience:** Platform / SRE engineers  
 **Duration:** ~45–60 minutes  
 **Cluster:** kind (`kind-pdb-pvc-demo` context, 1 control-plane + 2 workers)
@@ -50,7 +52,7 @@ Open **http://localhost:8080** — the dashboard loads immediately (no credentia
 
 ### GitOps repo
 
-Default repo URL: `https://github.com/freemanpdwork/k8s-pdb-pvc-eviction-demo.git` (path: `manifests/k8s-demo/overlays/relaxed`).
+Default repo URL: `https://github.com/freemanpdwork/k8s-pdb-pvc-eviction-demo.git` (path: `manifests/k8s-demo` — relaxed PDB at repo root; `overlays/strict` works after `make argocd` sets global kustomize load-restrictor options).
 
 `make setup` syncs from that repo automatically. For your own fork, push manifests first, then:
 
@@ -64,7 +66,7 @@ make setup
 Re-sync or re-register manually:
 
 ```bash
-make argocd-app
+make argocd-app    # applies local manifests/argocd/application.yaml (not from git)
 ```
 
 ### Multi-node kind cluster
@@ -310,8 +312,9 @@ make cluster-delete # delete kind cluster only
 | PVC Pending | `kubectl get sc` — kind default is `standard` (local-path) |
 | Pods on same node | Delete pods once: `kubectl delete pod -n demo -l app=demo-app`; or check worker count with `kubectl get nodes` |
 | Fewer than 2 workers | Recreate: `make clean && make cluster` |
+| Argo Sync **Unknown** / `ComparisonError` (kustomize load restrictor) | Default Application path is `manifests/k8s-demo` (no `../../`). For `overlays/strict`, run `make argocd` first (global `kustomize.buildOptions` on repo-server), then change Application path and `make argocd-app` |
 | Argo OutOfSync | Push manifests to `DEMO_REPO_URL` (see `make argocd-app` output); override with `DEMO_REPO_URL` for your fork; or `make deploy-direct` offline |
-| Argo sync timeout on setup | Ensure repo is reachable and `manifests/k8s-demo/overlays/relaxed` exists at `DEMO_REPO_URL`; fallback: `make deploy-direct` |
+| Argo sync timeout on setup | Ensure repo is reachable and `manifests/k8s-demo` exists at `DEMO_REPO_URL`; fallback: `make deploy-direct` |
 | Drain stuck | `make uncordon`; check PDB with `kubectl get pdb -n demo` |
 | Evict works under strict PDB | Confirm `make pdb-strict` applied; check `ALLOWED DISRUPTIONS` |
 

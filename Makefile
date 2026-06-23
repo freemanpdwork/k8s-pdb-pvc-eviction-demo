@@ -13,7 +13,7 @@ endif
 NAMESPACE       ?= demo
 STATEFULSET     ?= demo-app
 DEMO_REPO_URL   ?= https://github.com/freemanpdwork/k8s-pdb-pvc-eviction-demo.git
-DEMO_OVERLAY    ?= manifests/k8s-demo/overlays/relaxed
+DEMO_OVERLAY    ?= manifests/k8s-demo
 STRICT_OVERLAY  ?= manifests/k8s-demo/overlays/strict
 ARGOCD_NS       ?= argocd
 ARGOCD_INSTALL  ?= https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
@@ -193,6 +193,7 @@ argocd: check-cluster ## Install Argo CD and wait for server ready
 	@echo "Applying local demo config (anonymous admin, insecure HTTP)..."
 	@kubectl apply -n $(ARGOCD_NS) -f manifests/argocd/insecure-anonymous.yaml
 	@kubectl rollout restart deployment/argocd-server -n $(ARGOCD_NS)
+	@kubectl rollout restart deployment/argocd-repo-server -n $(ARGOCD_NS)
 	@echo "Waiting for argocd-server..."
 	@kubectl rollout status deployment/argocd-server -n $(ARGOCD_NS) --timeout=300s
 	@kubectl rollout status deployment/argocd-repo-server -n $(ARGOCD_NS) --timeout=300s
@@ -218,7 +219,7 @@ deploy-strict: ## Apply strict PDB overlay via kubectl
 
 argocd-app: ## Register Argo CD Application and wait until Synced/Healthy
 	@sed 's|DEMO_REPO_URL_PLACEHOLDER|$(DEMO_REPO_URL)|g' manifests/argocd/application.yaml | \
-		kubectl apply -f -
+		kubectl apply --server-side --force-conflicts -f -
 	@echo "Argo CD Application applied. repoURL=$(DEMO_REPO_URL)"
 	@$(MAKE) argocd-wait
 

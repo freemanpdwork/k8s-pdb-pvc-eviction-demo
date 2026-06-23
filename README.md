@@ -151,6 +151,26 @@ The dashboard is only reachable while port-forward is running. No login is requi
 
 For `argocd` CLI commands only, use `make argocd-password` and `argocd login ... --plaintext` (not needed for the web UI).
 
+### Argo CD sync status Unknown (ComparisonError)
+
+If `demo-app` shows **Sync: Unknown** with a `ComparisonError` about kustomize load restrictions:
+
+```text
+file '.../namespace.yaml' is not in or below '.../overlays/relaxed'
+```
+
+**Cause:** Kustomize overlays (`manifests/k8s-demo/overlays/relaxed`, `overlays/strict`) reference parent files via `../../`. Argo CD's repo-server runs kustomize with the default load restrictor, which blocks paths outside the overlay directory. The Application CRD does not support per-Application `kustomize.buildOptions` on older Argo CD versions.
+
+**Default fix:** The Application uses path `manifests/k8s-demo` (root `kustomization.yaml` lists files in the same directory — no `../../`). Re-apply:
+
+```bash
+make argocd-app
+```
+
+**Strict overlay via GitOps:** `make argocd` sets global `kustomize.buildOptions: --load-restrictor LoadRestrictionsNone` in `argocd-cmd-params-cm` and restarts `argocd-repo-server`. After that, change the Application path to `manifests/k8s-demo/overlays/strict` (edit `manifests/argocd/application.yaml` or patch the live Application), then `make argocd-app`.
+
+The Application is applied from the local `manifests/argocd/application.yaml` via `make argocd-app` — no git push required for that step. Push to GitHub only if you want the repo copy to match.
+
 ### Pods on the same node
 
 With 2 workers, anti-affinity usually spreads pods. If both land on one worker, delete pods once to reschedule:
@@ -177,7 +197,7 @@ make cluster-delete  # Delete kind cluster only
 make argocd
 ```
 
-Creates the `argocd` namespace, applies the upstream Argo CD install manifest with server-side apply (avoids CRD annotation size limits on Kubernetes 1.27+), applies local demo config (`manifests/argocd/insecure-anonymous.yaml`), and waits until `argocd-server` is ready.
+Creates the `argocd` namespace, applies the upstream Argo CD install manifest with server-side apply (avoids CRD annotation size limits on Kubernetes 1.27+), applies local demo config (`manifests/argocd/insecure-anonymous.yaml` — anonymous admin, insecure HTTP, and global `kustomize.buildOptions` for overlay paths), restarts `argocd-server` and `argocd-repo-server`, and waits until both are ready.
 
 > **Security:** Anonymous admin access is configured for **local demo only** — not for production.
 
@@ -227,7 +247,7 @@ argocd app diff demo-app
 https://github.com/freemanpdwork/k8s-pdb-pvc-eviction-demo.git
 ```
 
-(path: `manifests/k8s-demo/overlays/relaxed`)
+(path: `manifests/k8s-demo` — relaxed PDB; use `manifests/k8s-demo/overlays/strict` for strict PDB after `make argocd` enables global kustomize options)
 
 **Requirements:**
 
@@ -248,9 +268,11 @@ make cluster && make argocd && make deploy-direct && make demo-data
 Re-register or re-sync the Application manually:
 
 ```bash
-make argocd-app      # apply manifest + wait for Synced/Healthy
+make argocd-app      # apply local manifests/argocd/application.yaml + wait for Synced/Healthy
 make argocd-wait     # wait only (Application must already exist)
 ```
+
+`make argocd-app` substitutes `DEMO_REPO_URL` and applies `manifests/argocd/application.yaml` from this repo — it does not pull the Application definition from GitHub.
 
 ### GitOps vs local deploy
 
@@ -265,6 +287,8 @@ make argocd-wait     # wait only (Application must already exist)
 For local-only demos, `make pdb-strict` and `make pdb-relaxed` switch PDB policy instantly without git.
 
 ## Demo flow (summary)
+
+**Live command cheat sheet:** **[docs/DEMO-STEPS.md](docs/DEMO-STEPS.md)** (kubectl + k9s + Makefile shortcuts). Full speaker script: **[docs/DEMO.md](docs/DEMO.md)**.
 
 1. **Full bootstrap** — `make setup` (cluster + Argo CD + `demo-app` synced via GitOps); `make port-forward` → http://localhost:8080 (no login)
 2. **k9s tour** — pods spread across workers, PVCs bound
