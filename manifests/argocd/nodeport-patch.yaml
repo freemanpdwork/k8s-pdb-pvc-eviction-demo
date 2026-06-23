@@ -1,0 +1,16 @@
+# Local demo only — expose argocd-server on NodePort 30080 (insecure HTTP).
+# Requires kind extraPortMappings on the control-plane (see kind/cluster.yaml).
+# Existing clusters need: make cluster-delete && make cluster
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server
+  namespace: argocd
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8080
+      nodePort: 30080

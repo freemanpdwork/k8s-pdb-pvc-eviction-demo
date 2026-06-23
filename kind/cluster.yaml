@@ -9,5 +9,9 @@ apiVersion: kind.x-k8s.io/v1alpha4
 name: pdb-pvc-demo
 nodes:
   - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
   - role: worker
   - role: worker

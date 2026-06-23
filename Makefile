@@ -15,8 +15,11 @@ STATEFULSET     ?= demo-app
 DEMO_REPO_URL   ?= https://github.com/freemanpdwork/k8s-pdb-pvc-eviction-demo.git
 DEMO_OVERLAY    ?= manifests/k8s-demo
 STRICT_OVERLAY  ?= manifests/k8s-demo/overlays/strict
-ARGOCD_NS       ?= argocd
-ARGOCD_INSTALL  ?= https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+ARGOCD_NS         ?= argocd
+ARGOCD_LOCAL_PORT ?= 8888
+ARGOCD_PROXY_PORT ?= 8001
+ARGOCD_NODE_PORT  ?= 30080
+ARGOCD_INSTALL    ?= https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
 RELAXED_KUSTOMIZE := manifests/k8s-demo/overlays/relaxed
 STRICT_KUSTOMIZE  := manifests/k8s-demo/overlays/strict
@@ -30,8 +33,8 @@ define kustomize_delete
 	kubectl kustomize $(1) $(KUSTOMIZE_FLAGS) | kubectl delete -f - --ignore-not-found
 endef
 
-.PHONY: help setup cluster cluster-delete check-cluster fix-context argocd argocd-password argocd-app argocd-wait \
-        port-forward deploy deploy-direct deploy-strict pdb-relaxed pdb-strict \
+.PHONY: help setup cluster cluster-delete check-cluster fix-context argocd argocd-expose argocd-password argocd-app argocd-wait \
+        port-forward argocd-proxy deploy deploy-direct deploy-strict pdb-relaxed pdb-strict \
         demo-data wait-ready status logs evict drain uncordon teardown clean \
         dry-run validate
 
@@ -46,7 +49,7 @@ setup: ## Create kind cluster, install Argo CD, sync app via GitOps, write demo 
 	@$(MAKE) demo-data
 	@$(MAKE) status
 	@echo ""
-	@echo "Demo ready. Argo CD UI: make port-forward (then http://localhost:8080 — no login)"
+	@echo "Demo ready. Argo CD UI: http://localhost:$(ARGOCD_NODE_PORT) (no login; run make argocd-expose if needed)"
 	@echo "Application 'demo-app' is registered and synced from $(DEMO_REPO_URL)"
 
 cluster: ## Create kind cluster if missing and export kubeconfig
@@ -198,15 +201,48 @@ argocd: check-cluster ## Install Argo CD and wait for server ready
 	@kubectl rollout status deployment/argocd-server -n $(ARGOCD_NS) --timeout=300s
 	@kubectl rollout status deployment/argocd-repo-server -n $(ARGOCD_NS) --timeout=300s
 	@kubectl rollout status deployment/argocd-applicationset-controller -n $(ARGOCD_NS) --timeout=300s 2>/dev/null || true
-	@echo "Argo CD is ready. Dashboard: make port-forward (http://localhost:8080 — no login)"
+	@$(MAKE) argocd-expose
+
+argocd-expose: check-cluster ## Expose Argo CD UI via NodePort (ARGOCD_NODE_PORT, default 30080)
+	@echo "Waiting for argocd-server pod to be Ready..."
+	@kubectl wait --for=condition=Ready pod \
+		-l app.kubernetes.io/name=argocd-server -n $(ARGOCD_NS) --timeout=120s
+	@sed 's/nodePort: 30080/nodePort: $(ARGOCD_NODE_PORT)/' manifests/argocd/nodeport-patch.yaml | \
+		kubectl apply -f -
+	@echo ""
+	@echo "Argo CD UI (preferred on kind/Mac): http://localhost:$(ARGOCD_NODE_PORT)"
+	@echo "No login required. Fallback tunnels: make port-forward or make argocd-proxy"
+	@echo "Note: existing clusters need 'make cluster-delete && make cluster' for host port mapping"
 
 argocd-password: ## Print initial Argo CD admin password
 	@kubectl -n $(ARGOCD_NS) get secret argocd-initial-admin-secret \
 		-o jsonpath='{.data.password}' 2>/dev/null | base64 -d; echo
 
-port-forward: ## Port-forward Argo CD UI to http://localhost:8080 (leave running)
-	@echo "Forwarding http://localhost:8080 -> argocd-server:80 (Ctrl+C to stop)"
-	@kubectl port-forward svc/argocd-server -n $(ARGOCD_NS) 8080:80
+port-forward: check-cluster ## Port-forward Argo CD UI (fallback; prefer make argocd-expose on kind)
+	@echo "Waiting for argocd-server pod to be Ready..."
+	@kubectl wait --for=condition=Ready pod \
+		-l app.kubernetes.io/name=argocd-server -n $(ARGOCD_NS) --timeout=120s
+	@if command -v lsof >/dev/null 2>&1 && \
+		lsof -iTCP:$(ARGOCD_LOCAL_PORT) -sTCP:LISTEN -t >/dev/null 2>&1; then \
+		echo "ERROR: local port $(ARGOCD_LOCAL_PORT) is already in use." >&2; \
+		echo "Use another port: ARGOCD_LOCAL_PORT=9080 make port-forward" >&2; \
+		echo "Or use direct access: make argocd-expose → http://localhost:$(ARGOCD_NODE_PORT)" >&2; \
+		exit 1; \
+	fi
+	@echo "Prefer direct access on kind: make argocd-expose → http://localhost:$(ARGOCD_NODE_PORT)"
+	@echo "Open http://127.0.0.1:$(ARGOCD_LOCAL_PORT) (Ctrl+C to stop)"
+	@echo "If connection resets, use: make argocd-expose or make argocd-proxy"
+	@kubectl port-forward deployment/argocd-server -n $(ARGOCD_NS) \
+		--address 127.0.0.1 $(ARGOCD_LOCAL_PORT):8080
+
+argocd-proxy: check-cluster ## kubectl proxy to Argo CD UI (fallback; prefer make argocd-expose on kind)
+	@echo "Waiting for argocd-server pod to be Ready..."
+	@kubectl wait --for=condition=Ready pod \
+		-l app.kubernetes.io/name=argocd-server -n $(ARGOCD_NS) --timeout=120s
+	@echo "Prefer direct access on kind: make argocd-expose → http://localhost:$(ARGOCD_NODE_PORT)"
+	@echo "Open (leave this running):"
+	@echo "  http://127.0.0.1:$(ARGOCD_PROXY_PORT)/api/v1/namespaces/$(ARGOCD_NS)/services/http:argocd-server:80/proxy/"
+	@kubectl proxy --port=$(ARGOCD_PROXY_PORT) --address=127.0.0.1
 
 deploy: deploy-direct ## Apply relaxed overlay via kubectl (works offline)
 deploy-direct: ## kubectl apply relaxed overlay (no Argo CD required)

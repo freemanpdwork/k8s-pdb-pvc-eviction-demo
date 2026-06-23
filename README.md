@@ -28,7 +28,8 @@ make setup            # cluster + argocd + argocd-app (GitOps sync) + demo-data 
 # or create the cluster first:
 make cluster          # 1 control-plane + 2 workers (kind/cluster.yaml)
 make check-cluster    # context kind-pdb-pvc-demo, 3 nodes Ready
-make port-forward     # second terminal — Argo CD UI at http://localhost:8080 (no login)
+# Argo CD UI (after make argocd or make setup):
+open http://localhost:30080   # no login; no tunnel required on kind
 ```
 
 `make setup` registers the `demo-app` Application in Argo CD and waits until it is **Synced** and **Healthy** — the dashboard shows the app immediately after setup (no manual `make argocd-app`).
@@ -42,11 +43,13 @@ make setup            # cluster + argocd + GitOps sync + demo-data (one command)
 make status           # Pods, PVCs, PDB, node placement
 ```
 
-In a **second terminal**, start the Argo CD UI (no login required):
+In a **second terminal** (optional — only if NodePort is unavailable), start a tunnel fallback:
 
 ```bash
-make port-forward     # http://localhost:8080
+make port-forward     # http://127.0.0.1:8888 (fallback)
 ```
+
+**Preferred on kind/Mac:** after `make argocd` or `make setup`, open **[http://localhost:30080](http://localhost:30080)** directly — no port-forward or proxy required.
 
 The `demo-app` Application is already registered and synced — open the dashboard to see it **Synced / Healthy**.
 
@@ -136,15 +139,64 @@ make argocd
 
 ### Argo CD UI not loading
 
-The dashboard is only reachable while port-forward is running. No login is required for the local demo.
+**Preferred access (kind/Mac):** after `make argocd` or `make setup`, open **[http://localhost:30080](http://localhost:30080)** — no login, no tunnel. `make argocd` runs `make argocd-expose` automatically (NodePort + kind `extraPortMappings` in `kind/cluster.yaml`).
 
-1. **Start port-forward** (leave running in a terminal):
+If you created the cluster **before** this NodePort mapping was added, recreate it so Docker forwards host port 30080:
+
+```bash
+make cluster-delete
+make cluster
+make argocd
+```
+
+#### Diagnostics
+
+While a tunnel is running (`make port-forward` or `make argocd-proxy`), test from another terminal:
+
+```bash
+curl -v http://127.0.0.1:8888/          # port-forward default (ARGOCD_LOCAL_PORT)
+curl -v http://127.0.0.1:30080/         # NodePort (preferred)
+```
+
+Watch the server if the UI fails or resets:
+
+```bash
+kubectl logs -n argocd deployment/argocd-server -f
+```
+
+Confirm the service and NodePort:
+
+```bash
+kubectl get svc argocd-server -n argocd
+```
+
+#### Fallback: port-forward / kubectl proxy
+
+Tunnels can drop on kind/Mac when the browser connects (`connection reset by peer`). Use NodePort first; fall back only if needed.
+
+1. **NodePort (recommended):**
+   ```bash
+   make argocd-expose
+   # Open http://localhost:30080
+   ```
+2. **Port-forward** (leave running in a terminal):
    ```bash
    make port-forward
    ```
-2. **Open** [http://localhost:8080](http://localhost:8080) — use `http`, not `https`.
-3. **Confirm Argo CD is installed** — `kubectl get pods -n argocd` should show `argocd-server` Running.
-4. **Re-apply demo config** if you upgraded from an older install:
+   Forwards `deployment/argocd-server` pod port **8080** to **http://127.0.0.1:8888** (default `ARGOCD_LOCAL_PORT`). Override if busy:
+   ```bash
+   ARGOCD_LOCAL_PORT=9080 make port-forward
+   ```
+3. **kubectl proxy:**
+   ```bash
+   make argocd-proxy
+   # Open the printed URL (default http://127.0.0.1:8001/api/v1/namespaces/argocd/services/http:argocd-server:80/proxy/)
+   ```
+
+Use `http`, not `https`. No login is required for the local demo.
+
+4. **Confirm Argo CD is installed** — `kubectl get pods -n argocd -l app.kubernetes.io/name=argocd-server` should show a **Ready** pod.
+5. **Re-apply demo config** if you upgraded from an older install:
    ```bash
    make argocd
    ```
@@ -203,15 +255,22 @@ Creates the `argocd` namespace, applies the upstream Argo CD install manifest wi
 
 ### Dashboard (local)
 
-**No login required.** `make argocd` enables anonymous admin access and HTTP mode for the UI.
+**No login required.** `make argocd` enables anonymous admin access and HTTP mode for the UI, then exposes the dashboard on NodePort **30080**.
 
-Port-forward the UI (leave running):
+**Preferred (kind/Mac):** open **[http://localhost:30080](http://localhost:30080)** after `make argocd` or `make setup` — no second terminal.
+
+Re-expose manually if needed:
 
 ```bash
-make port-forward
+make argocd-expose    # http://localhost:30080 (ARGOCD_NODE_PORT to override)
 ```
 
-Forwards `argocd-server` to **http://localhost:8080**. Open that URL in your browser — the dashboard loads without credentials.
+**Fallback tunnels** (can reset on kind/Mac when the browser connects):
+
+```bash
+make port-forward     # http://127.0.0.1:8888 (ARGOCD_LOCAL_PORT to override)
+make argocd-proxy     # kubectl proxy — URL printed by make
+```
 
 ### CLI (optional)
 
@@ -224,7 +283,7 @@ brew install argocd
 For CLI commands you can log in with the initial admin password (`make argocd-password`, username `admin`):
 
 ```bash
-argocd login localhost:8080 --username admin --password <pwd> --plaintext
+argocd login localhost:30080 --username admin --password <pwd> --plaintext
 ```
 
 Or use `kubectl` to inspect Applications without the CLI.
@@ -290,7 +349,7 @@ For local-only demos, `make pdb-strict` and `make pdb-relaxed` switch PDB policy
 
 **Live command cheat sheet:** **[docs/DEMO-STEPS.md](docs/DEMO-STEPS.md)** (kubectl + k9s + Makefile shortcuts). Full speaker script: **[docs/DEMO.md](docs/DEMO.md)**.
 
-1. **Full bootstrap** — `make setup` (cluster + Argo CD + `demo-app` synced via GitOps); `make port-forward` → http://localhost:8080 (no login)
+1. **Full bootstrap** — `make setup` (cluster + Argo CD + `demo-app` synced via GitOps); open http://localhost:30080 (no login)
 2. **k9s tour** — pods spread across workers, PVCs bound
 3. **PVC persistence** — `make demo-data`, restart pod, marker survives on `/data`
 4. **Relaxed PDB** — `make evict` succeeds (minAvailable: 1)
@@ -336,8 +395,10 @@ make cluster         # Create kind cluster + export kubeconfig
 make cluster-delete  # Delete kind cluster
 make check-cluster   # Verify kind cluster and nodes
 make fix-context     # Fix empty/wrong kubectl context
-make argocd          # Install Argo CD (anonymous admin, HTTP)
-make port-forward    # Argo CD UI at http://localhost:8080 (no login)
+make argocd          # Install Argo CD (anonymous admin, HTTP) + NodePort expose
+make argocd-expose   # Expose Argo CD UI at http://localhost:30080 (kind/Mac)
+make port-forward    # Argo CD UI tunnel fallback (http://127.0.0.1:8888)
+make argocd-proxy    # kubectl proxy fallback for Argo CD UI
 make argocd-password # Initial admin password (CLI only)
 make argocd-app      # Register demo-app Application + wait for sync
 make argocd-wait     # Wait for demo-app Synced/Healthy
@@ -361,7 +422,7 @@ If you prefer Docker Desktop's built-in Kubernetes instead of kind:
 2. `kubectl config use-context docker-desktop`
 3. Run `make fix-context` if needed (supports `docker-desktop` as fallback)
 4. Continue with `make argocd && make argocd-app && make demo-data` (or `make setup` if using kind from scratch)
-5. `make port-forward` in a second terminal → http://localhost:8080 (no login)
+5. Open http://localhost:30080 after `make argocd` (or `make port-forward` as fallback)
 
 **Single-node note:** Docker Desktop usually provides one node. Eviction and strict PDB behave the same, but both demo pods may share that node and the drain demo is less realistic than with 2 kind workers.
 
