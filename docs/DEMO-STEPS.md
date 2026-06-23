@@ -42,6 +42,45 @@ make port-forward   # http://127.0.0.1:8888
 
 ---
 
+## Quick demo — 3 concepts, ~10 minutes
+
+Fastest path through the demo. Run `make setup` first.
+
+### 1. PVC persistence — data survives pod deletion
+
+```bash
+make status              # show pods + PVCs
+make evict               # evict one pod — PDB (relaxed) allows it
+make status              # pod rescheduled, PVC reattached, same data
+```
+
+**Point:** the pod restarted on a new node but the PVC followed it.
+
+### 2. PDB blocks eviction — switch to strict PDB
+
+```bash
+make pdb-strict          # minAvailable:2, ALLOWED DISRUPTIONS:0
+make evict               # Eviction API returns HTTP 429 — blocked
+make drain               # kubectl drain also blocked
+make pdb-relaxed         # restore — drain completes
+make uncordon
+```
+
+**Point:** PDB is enforced by the Eviction API, not just a hint.
+
+### 3. Argo CD GitOps — push a manifest change, watch it sync
+
+```bash
+# Edit manifests/k8s-demo/statefulset.yaml (e.g. change replicas: 3 → 2)
+git commit -am "demo: scale down" && git push
+# Open http://localhost:30080 — watch Argo CD detect drift and self-heal
+make status              # shows updated pod count
+```
+
+**Point:** Argo CD continuously reconciles; manual `kubectl` changes get reverted.
+
+---
+
 ## Suggested live order
 
 | # | Section | ~min | PDB mode |
