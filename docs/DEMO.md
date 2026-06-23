@@ -3,8 +3,103 @@
 **Command cheat sheet:** [DEMO-STEPS.md](DEMO-STEPS.md) — copy-paste kubectl commands, k9s views, and Makefile shortcuts for live demos.
 
 **Audience:** Platform / SRE engineers  
-**Duration:** ~45–60 minutes  
+**Duration:** ~45–60 minutes (or ~10 minutes with the quick demo below)  
 **Cluster:** kind (`kind-pdb-pvc-demo` context, 1 control-plane + 2 workers)
+
+---
+
+## Quick demo — 3 concepts, ~10 minutes
+
+For a focused audience or tight timeslot. For the full 45-minute version with k9s walkthroughs and drift detection, see [Acts 1–8](#act-1--cluster--argo-cd-5-min) below.
+
+### Setup (before the room, ~2 min)
+
+```bash
+make setup           # cluster + Argo CD + GitOps sync + demo data
+```
+
+In a second terminal, start the HTTP endpoint — leave it running throughout the demo:
+
+```bash
+make demo-url        # → http://localhost:8090/  (nginx serves PVC data)
+```
+
+Open **http://localhost:8090/** in a browser. It shows which pod served the request, which PVC is mounted, which node the pod is on, and when the data was last written. This page is the visual anchor for the next two concepts.
+
+---
+
+### Concept 1 — PVC persistence: data survives eviction (~3 min)
+
+**Talking point:** The PVC is not the pod. Data at `/data` lives on a persistent volume; the pod is just a consumer. Evict the pod, reschedule it — same data comes back.
+
+```bash
+make status          # pods on separate nodes, PVCs Bound, PDB relaxed
+make demo-data       # write marker.txt + index.html to each pod's /data
+```
+
+Refresh **http://localhost:8090/** — note the pod name, node, and write timestamp.
+
+```bash
+make evict           # Eviction API → HTTP 201 Created (relaxed PDB allows it)
+```
+
+Refresh **http://localhost:8090/** — same write timestamp, possibly a different node listed. The PVC followed the pod.
+
+```bash
+curl http://localhost:8090/marker.txt   # confirm same content as before eviction
+```
+
+**Key point:** the browser tab never needed to know the pod moved. The PVC reattached automatically.
+
+---
+
+### Concept 2 — PDB enforcement: eviction returns HTTP 429 (~4 min)
+
+**Talking point:** PodDisruptionBudget is not advisory — it gates the Eviction API directly. When no disruptions are allowed, the API returns HTTP 429. `kubectl drain` uses the same API, so drain is also blocked.
+
+```bash
+make pdb-strict      # minAvailable: 2, ALLOWED DISRUPTIONS: 0 with 2 replicas
+make evict           # Eviction API → HTTP 429 Too Many Requests — pod NOT deleted
+```
+
+Show the 429 output from the terminal. Refresh **http://localhost:8090/** — still showing the original pod (unchanged).
+
+```bash
+make drain           # cordon + drain a worker — drain also blocked by PDB
+make status          # node cordoned (SchedulingDisabled), pods untouched
+```
+
+Restore:
+
+```bash
+make pdb-relaxed     # restore 1 allowed disruption
+make uncordon        # restore cordoned node
+```
+
+**Key point:** PDB enforcement is at the API layer, not the scheduler — there's no way to "accidentally" evict past a budget.
+
+---
+
+### Concept 3 — Argo CD GitOps: push a change, watch it sync (~3 min)
+
+**Talking point:** Desired state lives in git. Argo CD continuously reconciles — manual `kubectl` changes are drift and get reverted.
+
+```bash
+# Edit manifests/k8s-demo/statefulset.yaml (e.g. add a label or env var)
+git commit -am "demo: change something visible" && git push
+```
+
+Open **http://localhost:30080** (Argo CD UI, no login) — watch the Application go OutOfSync → Syncing → Synced.
+
+```bash
+make status          # cluster now matches git
+```
+
+Bonus: make a manual `kubectl label` change — Argo CD reverts it within ~3 minutes (selfHeal).
+
+**Key point:** GitOps means the cluster is always a function of git. Drift is detected and healed automatically.
+
+---
 
 ## Before you start
 
@@ -39,16 +134,15 @@ After bootstrap, open the Argo CD dashboard (see below). The `demo-app` Applicat
 
 > **Security:** Anonymous admin is **local demo only** — never use this configuration in production.
 
-Keep port-forward running in a **second terminal**:
+**Preferred (NodePort, no tunnel):** Open **http://localhost:30080** — available immediately after `make setup` or `make argocd-expose`.
+
+**Fallback (port-forward):** if the NodePort isn't reachable, run in a second terminal:
 
 ```bash
-# second terminal — leave running
-make port-forward
+make port-forward   # → http://localhost:8888
 ```
 
-Open **http://localhost:8080** — the dashboard loads immediately (no credentials, no certificate warnings).
-
-**CLI only (optional):** `brew install argocd`, then `argocd login localhost:8080 --username admin --password <pwd> --plaintext` (password from `make argocd-password`). The web UI does not need this.
+**CLI only (optional):** `brew install argocd`, then `argocd login localhost:30080 --username admin --password <pwd> --plaintext` (password from `make argocd-password`). The web UI does not need this.
 
 ### GitOps repo
 
@@ -88,11 +182,11 @@ Contrast with production: anti-affinity is *preferred*, not guaranteed — menti
 make setup          # or: make cluster && make argocd && make argocd-app
 make check-cluster
 kubectl get nodes -o wide
-# second terminal (leave running):
-make port-forward
+# second terminal — leave running for HTTP endpoint demo:
+make demo-url       # → http://localhost:8090/  (PVC data served by nginx)
 ```
 
-**Expected:** 3 nodes (1 control-plane + 2 workers), all `Ready`. Argo CD pods Running in `argocd` namespace. Context `kind-pdb-pvc-demo`. UI at http://localhost:8080 — open in browser, no login. Application `demo-app` already **Synced / Healthy** in the dashboard.
+**Expected:** 3 nodes (1 control-plane + 2 workers), all `Ready`. Argo CD pods Running in `argocd` namespace. Context `kind-pdb-pvc-demo`. Argo CD UI at http://localhost:30080 — open in browser, no login. Application `demo-app` already **Synced / Healthy** in the dashboard.
 
 **k9s:** `:nodes`, then `:applications argocd` — `demo-app` is listed
 
@@ -192,7 +286,7 @@ kubectl get application demo-app -n argocd -w
 make status
 ```
 
-In the Argo CD UI (already open at http://localhost:8080), watch the Application sync — no login step.
+In the Argo CD UI (already open at http://localhost:30080), watch the Application sync — no login step.
 
 **Option B — Local only (no git push):**
 
@@ -278,7 +372,7 @@ kubectl label pod -n demo demo-app-0 drift=demo --overwrite
 # Or: argocd app sync demo-app --force
 ```
 
-With Argo CD UI (http://localhost:8080): show OutOfSync → Sync → label removed. No login required.
+With Argo CD UI (http://localhost:30080): show OutOfSync → Sync → label removed. No login required.
 
 ---
 
@@ -307,7 +401,7 @@ make cluster-delete # delete kind cluster only
 | `Kubeconfig not found` | `make cluster` |
 | `cluster unreachable` | `docker ps`; `make cluster-delete && make cluster` |
 | Wrong kubectl context | `export KUBECONFIG=$(pwd)/.kube/kind-pdb-pvc-demo` or `make fix-context` |
-| Argo CD UI blank / connection refused | Run `make port-forward` in a second terminal; open http://localhost:8080 (not https) |
+| Argo CD UI blank / connection refused | `make argocd-expose` for NodePort at http://localhost:30080; fallback: `make port-forward` → http://localhost:8888 (not https) |
 | Argo CD login prompt | Re-run `make argocd` to apply `insecure-anonymous.yaml`; UI should need no credentials |
 | PVC Pending | `kubectl get sc` — kind default is `standard` (local-path) |
 | Pods on same node | Delete pods once: `kubectl delete pod -n demo -l app=demo-app`; or check worker count with `kubectl get nodes` |
