@@ -1,6 +1,6 @@
 # k8s PDB + PVC + Eviction Demo
 ###
-Hands-on demo of **PodDisruptionBudgets**, **PVC-backed StatefulSets**, voluntary **eviction**, node **drain**, and **Argo CD GitOps** on a local **kind** cluster (3 nodes: 1 control-plane + 2 workers).
+Hands-on demo of **PodDisruptionBudgets**, **PVC-backed StatefulSets**, voluntary **eviction**, node **drain**, and **Argo CD GitOps** on a local **kind** cluster (4 nodes: 1 control-plane + 3 workers).
 
 ## Prerequisites
 
@@ -24,17 +24,21 @@ brew install kind kubectl
 ### Next steps
 
 ```bash
+make preflight        # validate overlays, cluster, GitHub reachability, print URLs
 make setup            # cluster + argocd + argocd-app (GitOps sync) + demo-data (recommended)
 # or create the cluster first:
-make cluster          # 1 control-plane + 2 workers (kind/cluster.yaml)
-make check-cluster    # context kind-pdb-pvc-demo, 3 nodes Ready
-# Argo CD UI (after make argocd or make setup):
-open http://localhost:30080   # no login; no tunnel required on kind
+make cluster          # 1 control-plane + 3 workers (kind/cluster.yaml)
+make check-cluster    # context kind-pdb-pvc-demo, 4 nodes Ready
+# After make setup (no tunnel required on kind):
+open http://localhost:30080   # Argo CD UI — no login
+make demo-url         # → http://localhost:30090/ — PVC data in browser
 ```
+
+**Prep checklist:** `make preflight` · `make setup` · `make status` · Argo CD at :30080 · demo app at :30090 (`make demo-url`). GitHub unreachable? Use `make setup-offline` instead.
 
 `make setup` registers the `demo-app` Application in Argo CD and waits until it is **Synced** and **Healthy** — the dashboard shows the app immediately after setup (no manual `make argocd-app`).
 
-The Makefile auto-exports `KUBECONFIG` to `.kube/kind-pdb-pvc-demo` when that file exists. With 2 workers, pod anti-affinity usually spreads `demo-app-0` and `demo-app-1` across workers — ideal for the drain demo. kind's default `standard` StorageClass needs no extra setup.
+The Makefile auto-exports `KUBECONFIG` to `.kube/kind-pdb-pvc-demo` when that file exists. With 3 workers, pod anti-affinity usually spreads `demo-app-0` and `demo-app-1` across workers — ideal for the drain demo. kind's default `standard` StorageClass needs no extra setup.
 
 ## Quick start
 
@@ -43,13 +47,18 @@ make setup            # cluster + argocd + GitOps sync + demo-data (one command)
 make status           # Pods, PVCs, PDB, node placement
 ```
 
-In a **second terminal** (optional — only if NodePort is unavailable), start a tunnel fallback:
+In a second terminal (optional — only if NodePort is unavailable), start a tunnel fallback:
 
 ```bash
-make port-forward     # http://127.0.0.1:8888 (fallback)
+make port-forward     # http://127.0.0.1:8888 (Argo CD fallback)
 ```
 
-**Preferred on kind/Mac:** after `make argocd` or `make setup`, open **[http://localhost:30080](http://localhost:30080)** directly — no port-forward or proxy required.
+**Preferred on kind/Mac:** after `make setup` or `make deploy-direct`:
+
+- Argo CD UI: **[http://localhost:30080](http://localhost:30080)** — no tunnel
+- Demo app HTTP: **`make demo-url`** → **[http://localhost:30090](http://localhost:30090)** — PVC data in the browser
+
+Run **`make preflight`** before presenting — validates overlays, checks the cluster, probes GitHub reachability, and prints both URLs.
 
 The `demo-app` Application is already registered and synced — open the dashboard to see it **Synced / Healthy**.
 
@@ -97,7 +106,7 @@ WARNING: current context is '' (expected kind-pdb-pvc-demo).
 | Check | Expected |
 |-------|----------|
 | `kubectl config current-context` | `kind-pdb-pvc-demo` |
-| `kubectl get nodes` | 3 nodes (1 control-plane + 2 workers) in `Ready` |
+| `kubectl get nodes` | 4 nodes (1 control-plane + 3 workers) in `Ready` |
 | `echo $KUBECONFIG` | `.../k8s-pdb-pvc-eviction-demo/.kube/kind-pdb-pvc-demo` (or empty if using default after export) |
 
 ### Cluster unreachable
@@ -111,7 +120,7 @@ Context is correct but `kubectl get nodes` fails:
    make cluster-delete
    make cluster
    ```
-4. **Check kind nodes** — `docker ps --filter name=pdb-pvc-demo` should show 3 containers.
+4. **Check kind nodes** — `docker ps --filter name=pdb-pvc-demo` should show 4 containers.
 
 ### Argo CD install fails: CRD annotation too long (Kubernetes 1.27+)
 
@@ -225,7 +234,7 @@ The Application is applied from the local `manifests/argocd/application.yaml` vi
 
 ### Pods on the same node
 
-With 2 workers, anti-affinity usually spreads pods. If both land on one worker, delete pods once to reschedule:
+With 3 workers, anti-affinity usually spreads pods. If both land on one worker, delete pods once to reschedule:
 
 ```bash
 kubectl delete pod -n demo demo-app-0 demo-app-1
@@ -321,6 +330,8 @@ make setup
 3. **Offline / no git** — skip GitOps and apply locally:
 
 ```bash
+make setup-offline    # cluster + argocd + deploy-direct + demo-data
+# or step by step:
 make cluster && make argocd && make deploy-direct && make demo-data
 ```
 
@@ -343,7 +354,7 @@ make argocd-wait     # wait only (Application must already exist)
 | `make pdb-strict` | Switch to strict PDB without git (kubectl) |
 | `make deploy-strict` | Full strict overlay apply |
 
-For local-only demos, `make pdb-strict` and `make pdb-relaxed` switch PDB policy instantly without git.
+For local-only demos, `make pdb-strict` and `make pdb-relaxed` switch PDB policy instantly without git. Run `make argocd-pause-sync` first if Argo CD is managing the app — otherwise selfHeal reverts PDB changes within ~3 minutes.
 
 ## Demo flow (summary)
 
@@ -376,8 +387,9 @@ Useful views during demo: `:pods demo`, `:pvc demo`, `:pdb demo`, `:applications
 ```
 kind cluster pdb-pvc-demo (kind-pdb-pvc-demo context)
 ├── control-plane
-├── worker A  ── demo-app-0  (PVC demo-app-data-demo-app-0)
-└── worker B  ── demo-app-1  (PVC demo-app-data-demo-app-1)
+├── worker A  ── demo-app-0  (PVC data-demo-app-0)
+├── worker B  ── demo-app-1  (PVC data-demo-app-1)
+└── worker C  (idle — drain demo target)
 
 StatefulSet demo-app (2 replicas, Parallel)
   └── volumeClaimTemplates → 1Gi RWO mounted at /data
@@ -391,17 +403,23 @@ PDB demo-app-pdb
 ```bash
 make help            # All targets
 make setup           # Full demo bootstrap (cluster + argocd + GitOps sync + demo-data)
+make setup-offline   # Bootstrap without GitOps (cluster + argocd + deploy-direct + demo-data)
+make preflight       # Validate overlays + cluster + GitHub reachability + print URLs
 make cluster         # Create kind cluster + export kubeconfig
 make cluster-delete  # Delete kind cluster
 make check-cluster   # Verify kind cluster and nodes
 make fix-context     # Fix empty/wrong kubectl context
 make argocd          # Install Argo CD (anonymous admin, HTTP) + NodePort expose
 make argocd-expose   # Expose Argo CD UI at http://localhost:30080 (kind/Mac)
+make demo-expose     # Expose demo app HTTP at http://localhost:30090 (kind/Mac)
+make demo-url        # Print demo app URL and apply NodePort if needed
 make port-forward    # Argo CD UI tunnel fallback (http://127.0.0.1:8888)
 make argocd-proxy    # kubectl proxy fallback for Argo CD UI
 make argocd-password # Initial admin password (CLI only)
 make argocd-app      # Register demo-app Application + wait for sync
 make argocd-wait     # Wait for demo-app Synced/Healthy
+make argocd-pause-sync  # Disable selfHeal before local PDB switches
+make argocd-resume-sync # Restore automated sync from application.yaml
 make deploy          # Apply relaxed overlay (offline kubectl)
 make demo-data       # Write PVC markers
 make pdb-strict      # Strict PDB (blocks eviction)
@@ -424,7 +442,7 @@ If you prefer Docker Desktop's built-in Kubernetes instead of kind:
 4. Continue with `make argocd && make argocd-app && make demo-data` (or `make setup` if using kind from scratch)
 5. Open http://localhost:30080 after `make argocd` (or `make port-forward` as fallback)
 
-**Single-node note:** Docker Desktop usually provides one node. Eviction and strict PDB behave the same, but both demo pods may share that node and the drain demo is less realistic than with 2 kind workers.
+**Single-node note:** Docker Desktop usually provides one node. Eviction and strict PDB behave the same, but both demo pods may share that node and the drain demo is less realistic than with 3 kind workers.
 
 ## License
 

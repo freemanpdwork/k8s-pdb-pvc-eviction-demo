@@ -1,6 +1,16 @@
 # Demo steps — command cheat sheet
 
-Condensed speaker reference for live demos. Full narrative, timing, and troubleshooting: **[DEMO.md](DEMO.md)**.
+Condensed speaker reference for live demos. Full narrative and timing: **[DEMO.md](DEMO.md)**. Troubleshooting: **[README.md#troubleshooting](../README.md#troubleshooting)**.
+
+## Choose your track
+
+| Track | ~time | Sections | Key commands |
+|-------|-------|----------|--------------|
+| **10 min** | 10m | [Quick demo — 3 concepts](#quick-demo--3-concepts-10-minutes) | `make setup` · `make demo-url` · `make evict` · `make pdb-strict` |
+| **30 min** | 30m | [Prep](#prep-before-the-room) · [1 GitOps](#1-gitops-deployment) · [3 PVC](#3-pvc-persistence) · [4 PDB](#4-pdb-protection) · [5 Eviction](#5-eviction-api) | `make preflight` · `make demo-data` · `make pdb-strict` · `make evict` |
+| **60 min** | 60m | [Suggested live order](#suggested-live-order) (sections 0–6) | `make argocd-pause-sync` · `make drain` · `make uncordon` · full cheat sheet below |
+
+Run `make preflight` before the room — validates overlays, checks the cluster, probes GitHub reachability, and prints Argo CD (`:30080`) and demo app (`:30090`) URLs.
 
 | Resource | Name |
 |----------|------|
@@ -22,19 +32,24 @@ cd k8s-pdb-pvc-eviction-demo
 make setup          # cluster + Argo CD + demo-app synced + demo data
 make check-cluster  # context kind-pdb-pvc-demo, 4 nodes Ready
 make status         # pods spread, PVCs Bound, PDB present
+make preflight      # validate overlays + cluster + GitHub + print URLs
+# Before strict PDB / drain acts (GitOps setup only):
+make argocd-pause-sync   # disable selfHeal so make pdb-strict is not reverted
 # Argo CD UI (preferred — no tunnel):
 open http://localhost:30080
-# Fallback if NodePort unavailable:
-make port-forward   # http://127.0.0.1:8888
-# Or: make argocd-proxy (prints proxy URL)
+# Demo app HTTP (PVC data in browser — no tunnel):
+make demo-url       # → http://localhost:30090/
 ```
 
 | Step | Command | Notes |
 |------|---------|-------|
 | Bootstrap | `make setup` | Registers `demo-app` Application; waits Synced/Healthy |
 | Verify | `make check-cluster` | 1 control-plane + 3 workers Ready |
+| Pause sync | `make argocd-pause-sync` | **Before strict PDB acts** — prevents selfHeal revert (~3 min) |
 | Snapshot | `make status` | `demo-app-0` / `demo-app-1` on separate workers |
+| Preflight | `make preflight` | Overlays, cluster, GitHub reachability, URLs |
 | Argo CD UI | http://localhost:30080 | After `make argocd` / `make setup` — no login; `make argocd-expose` to re-apply |
+| Demo app HTTP | `make demo-url` | http://localhost:30090/ — `make demo-expose` to re-apply NodePort |
 | Argo CD fallback | `make port-forward` | Second terminal — tunnel; can reset on kind/Mac |
 | Optional | `k9s` | `:nodes`, `:applications argocd`, `:pods demo` |
 
@@ -200,8 +215,14 @@ After section 6, run `make uncordon` if any node is cordoned. Relaxed PDB is the
 | Target | Purpose |
 |--------|---------|
 | `make setup` | Full bootstrap (cluster + Argo CD + GitOps sync + demo data) |
+| `make setup-offline` | Bootstrap without GitOps (cluster + Argo CD + deploy-direct + demo data) |
+| `make preflight` | Validate overlays + check cluster + GitHub + print URLs |
 | `make status` | Nodes, pods, PVCs, PDB, Argo Application |
 | `make argocd-expose` | Argo CD UI at http://localhost:30080 (preferred on kind/Mac) |
+| `make demo-expose` | Demo app HTTP at http://localhost:30090 (preferred on kind/Mac) |
+| `make demo-url` | Print demo app URL and apply NodePort if needed |
+| `make argocd-pause-sync` | Disable selfHeal before local `pdb-strict` / `pdb-relaxed` |
+| `make argocd-resume-sync` | Restore automated sync from `manifests/argocd/application.yaml` |
 | `make port-forward` | Argo CD UI tunnel fallback (`ARGOCD_LOCAL_PORT`, default 8888) |
 | `make argocd-proxy` | kubectl proxy fallback for Argo CD UI |
 | `make demo-data` | Write `/data/marker.txt` on each pod's PVC |
@@ -293,6 +314,8 @@ kubectl get statefulset,pods -n demo -w
 
 **Talking point:** Data lives on the PVC at `/data`, not the container filesystem. Eviction and reschedule reattach the same volume claim.
 
+> **Voluntary vs forced delete:** `kubectl delete pod` bypasses the Eviction API — the API server deletes the pod directly. PDB does **not** block `kubectl delete`. Use `make evict` or `kubectl drain` to demonstrate PDB enforcement; reserve `kubectl delete pod` for drift/StatefulSet demos (section 2) or PVC persistence only.
+
 ### kubectl
 
 ```bash
@@ -335,6 +358,7 @@ kubectl get pdb -n demo demo-app-pdb -o jsonpath='minAvailable={.spec.minAvailab
 ### kubectl — strict
 
 ```bash
+make argocd-pause-sync   # if GitOps setup — prevents selfHeal revert
 make pdb-strict
 kubectl get pdb -n demo demo-app-pdb -o wide
 kubectl get pdb -n demo demo-app-pdb -o jsonpath='minAvailable={.spec.minAvailable} allowed={.status.disruptionsAllowed}{"\n"}'
@@ -358,7 +382,9 @@ kubectl get pdb -n demo demo-app-pdb -o jsonpath='minAvailable={.spec.minAvailab
 
 ## 5. Eviction API
 
-**Talking point:** `kubectl drain` and `kubectl evict` use the policy/v1 **Eviction** API. The PDB controller decides allow (HTTP 201) or block (HTTP 429).
+**Talking point:** `kubectl drain` and `make evict` use the policy/v1 **Eviction** API. The PDB controller decides allow (HTTP 201) or block (HTTP 429).
+
+> **Voluntary vs forced delete:** `kubectl delete pod` is **not** gated by PDB — it removes the pod immediately without consulting the Eviction API. `make evict`, `kubectl drain`, and cluster autoscaler scale-down all use the Eviction API and respect PDB. Do not use `kubectl delete` when demonstrating PDB blocks.
 
 ### kubectl — relaxed (eviction succeeds)
 
@@ -465,20 +491,13 @@ make cluster-delete  # delete kind cluster only
 
 ---
 
-## Argo CD UI troubleshooting
+## Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| UI unreachable at :30080 | `make argocd-expose`; if cluster predates NodePort mapping: `make cluster-delete && make cluster && make argocd` |
-| `connection reset by peer` / `lost connection to pod` | Use http://localhost:30080 (`make argocd-expose`); avoid tunnels on kind/Mac |
-| `local port … is already in use` | `ARGOCD_LOCAL_PORT=9080 make port-forward` or use NodePort :30080 |
-| UI blank / connection refused | Use `http://` not `https`; `kubectl logs -n argocd deployment/argocd-server -f` |
-| Pod not Ready | `kubectl get pods -n argocd -l app.kubernetes.io/name=argocd-server` — wait or `make argocd` |
+See **[README.md#troubleshooting](../README.md#troubleshooting)** for full diagnostics (context, cluster, Argo CD UI, GitOps sync, drain/PDB).
 
-**Diagnostics (another terminal):**
+Quick checks:
 
-```bash
-curl -v http://127.0.0.1:30080/
-kubectl logs -n argocd deployment/argocd-server -f
-kubectl get svc argocd-server -n argocd
-```
+- **Argo CD UI unreachable** — `make argocd-expose` → http://localhost:30080
+- **Demo app HTTP unreachable** — `make demo-expose` → http://localhost:30090
+- **Cluster predates NodePort mappings** — `make cluster-delete && make cluster`
+- **GitHub unreachable** — `make setup-offline` instead of `make setup`

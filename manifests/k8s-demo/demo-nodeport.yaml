@@ -1,0 +1,16 @@
+# Local demo only — expose demo-app-http on NodePort 30090 (nginx serves PVC data).
+# Requires kind extraPortMappings on the control-plane (see kind/cluster.yaml).
+# Existing clusters need: make cluster-delete && make cluster
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app-http
+  namespace: demo
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: http
+      nodePort: 30090

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Write marker.txt and index.html to /data on each demo-app pod (PVC-backed).
-# index.html is served by nginx at http://localhost:8090/ (via make demo-url).
+# index.html is served by nginx at http://localhost:30090/ (via make demo-url).
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-demo}"
@@ -60,7 +60,7 @@ while IFS= read -r pod; do
 HTMLEOF
 )
   printf '%s\n' "${html_content}" | kubectl exec -i -n "${NAMESPACE}" "${pod}" -- sh -c "cat > /data/index.html"
-  echo "  index.html written to ${pod}:/data/ (served at http://localhost:8090/ via make demo-url)"
+  echo "  index.html written to ${pod}:/data/ (served at http://localhost:30090/ via make demo-url)"
 
 done <<< "${pods}"
 
