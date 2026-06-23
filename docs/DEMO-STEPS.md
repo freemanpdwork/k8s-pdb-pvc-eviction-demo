@@ -20,7 +20,7 @@ Condensed speaker reference for live demos. Full narrative, timing, and troubles
 ```bash
 cd k8s-pdb-pvc-eviction-demo
 make setup          # cluster + Argo CD + demo-app synced + demo data
-make check-cluster  # context kind-pdb-pvc-demo, 3 nodes Ready
+make check-cluster  # context kind-pdb-pvc-demo, 4 nodes Ready
 make status         # pods spread, PVCs Bound, PDB present
 # Argo CD UI (preferred — no tunnel):
 open http://localhost:30080
@@ -78,7 +78,7 @@ kill %1   # stop the proxy
 kubectl get pods,pvc -n demo -o wide
 ```
 
-**Point:** the pod restarted (possibly on a new node) but the PVC followed it — data at `/data` is intact.
+**Point:** the pod restarted and the data at `/data` is intact. With kind's `local-path-provisioner`, the PV has required node affinity for the original node, so the pod is constrained back to the same worker — the PVC doesn't "follow" to a new node, it pulls the pod home.
 
 ---
 
@@ -419,11 +419,12 @@ kubectl get events -n demo --sort-by='.lastTimestamp' | tail -15
 make status
 ```
 
-Manual cordon + drain (pick worker from `kubectl get pods -n demo -o wide`):
+Manual cordon + drain (pick the worker running `demo-app-0`):
 
 ```bash
-kubectl cordon pdb-pvc-demo-worker
-kubectl drain pdb-pvc-demo-worker \
+NODE=$(kubectl get pods -n demo demo-app-0 -o jsonpath='{.spec.nodeName}')
+kubectl cordon "$NODE"
+kubectl drain "$NODE" \
   --ignore-daemonsets --delete-emptydir-data --grace-period=30 --timeout=120s
 ```
 
@@ -449,7 +450,7 @@ kubectl get pods -n demo -o wide
 
 **Expected (strict):** Worker cordoned (`SchedulingDisabled`); drain fails or times out; demo pods on the remaining workers keep running; events mention PodDisruptionBudget.
 
-**Expected (relaxed):** One pod evicts from cordoned worker and reschedules on the other; PVC rebinds; drain completes for demo pods.
+**Expected (relaxed):** PDB allows the eviction (HTTP 201), so the pod is terminated from the cordoned worker. However, `local-path-provisioner` PVs have required node affinity — `demo-app-0` will be stuck **Pending** until the node is uncordoned, because its PVC can only bind on the original worker. `demo-app-1` on the other worker stays Running. Run `make uncordon` to restore. This is the real-world reason production stateful workloads use distributed storage (Ceph, EFS, etc.) instead of node-local PVs.
 
 ---
 
