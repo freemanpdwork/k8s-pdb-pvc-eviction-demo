@@ -37,7 +37,7 @@ FMT_RESET := \033[0m
 .PHONY: help setup cluster cluster-delete check-cluster fix-context guard-context \
         argocd argocd-expose argocd-password argocd-app argocd-wait \
         port-forward argocd-proxy deploy deploy-direct deploy-strict pdb-relaxed pdb-strict \
-        demo-data wait-ready status logs evict drain uncordon teardown clean \
+        demo-data demo-url wait-ready status logs evict drain uncordon teardown clean \
         dry-run validate
 
 help: ## Show available targets
@@ -335,6 +335,14 @@ status: ## Show pods, PVCs, PDB, and node placement
 	@kubectl get application demo-app -n $(ARGOCD_NS) 2>/dev/null || \
 		echo "(no Argo CD Application — run 'make argocd-app' or 'make setup')"
 	@echo ""
+
+demo-url: ## Port-forward demo-app HTTP to localhost:8090 (PVC data served by nginx)
+	@printf '$(FMT_H)Demo app HTTP:$(FMT_RESET) http://localhost:8090/\n'
+	@echo "  http://localhost:8090/           → index.html (pod name, PVC, node)"
+	@echo "  http://localhost:8090/marker.txt → raw PVC marker file"
+	@echo "  Ctrl+C to stop"
+	@printf '$(FMT_C)  $ kubectl port-forward svc/demo-app-http -n $(NAMESPACE) 8090:80$(FMT_RESET)\n'
+	@kubectl port-forward svc/demo-app-http -n $(NAMESPACE) 8090:80
 
 logs: ## Tail logs from demo-app pods
 	@printf '$(FMT_C)  $ kubectl logs -n $(NAMESPACE) -l app=demo-app --tail=50 --prefix=true$(FMT_RESET)\n'

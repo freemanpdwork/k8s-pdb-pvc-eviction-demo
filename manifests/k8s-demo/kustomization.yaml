@@ -4,8 +4,10 @@ kind: Kustomization
 # Default (relaxed PDB) — prefer overlays/relaxed for deploy targets
 resources:
   - namespace.yaml
+  - nginx-config.yaml
   - statefulset.yaml
   - service.yaml
+  - service-http.yaml
   - pdb-relaxed.yaml
 
 labels:

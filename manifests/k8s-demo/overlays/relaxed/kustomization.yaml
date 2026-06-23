@@ -3,8 +3,10 @@ kind: Kustomization
 
 resources:
   - ../../namespace.yaml
+  - ../../nginx-config.yaml
   - ../../statefulset.yaml
   - ../../service.yaml
+  - ../../service-http.yaml
   - ../../pdb-relaxed.yaml
 
 labels:

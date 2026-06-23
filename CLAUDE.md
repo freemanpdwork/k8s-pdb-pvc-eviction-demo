@@ -103,6 +103,18 @@ labels:
 ### StatefulSet selector is immutable
 Once a StatefulSet is created, `.spec.selector` cannot be changed. Do not remove labels from the selector or you'll be forced to delete and recreate the StatefulSet (which would briefly delete the pods, though PVCs survive).
 
+### Eviction API requires `kubectl proxy + curl`, NOT `kubectl create -f -`
+The Eviction resource is a **pod subresource** at `/api/v1/namespaces/{ns}/pods/{name}/eviction`. It does not appear in `kubectl api-resources` and cannot be mapped by `kubectl create`. Always use:
+```bash
+kubectl proxy --port=38001 &
+curl -s -w "\nHTTP %{http_code}\n" -X POST \
+  http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"demo-app-0","namespace":"demo"}}'
+kill %1
+```
+`evict-pod.sh` uses this approach automatically (starts proxy on a random port, POSTs, shows HTTP 201 or 429).
+
 ### Context safety guard
 All destructive Makefile targets depend on `guard-context`, which aborts if the current kubectl context is not one of:
 - `kind-pdb-pvc-demo`

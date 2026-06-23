@@ -65,14 +65,14 @@ make status    # pod rescheduled, PVC reattached, same data
 kubectl get nodes -o wide
 kubectl get pods,pvc,pdb -n demo -o wide
 
-# Evict a pod via the Eviction API (HTTP 201 = allowed)
-kubectl create -f - <<'EOF'
-apiVersion: policy/v1
-kind: Eviction
-metadata:
-  name: demo-app-0
-  namespace: demo
-EOF
+# Evict a pod via the Eviction API (Eviction is a pod subresource — use proxy + curl)
+kubectl proxy --port=38001 &
+curl -s -w "\nHTTP %{http_code}\n" -X POST \
+  http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"demo-app-0","namespace":"demo"}}'
+kill %1   # stop the proxy
+# → HTTP 201 Created (eviction allowed)
 
 # Watch recreation and PVC reattachment
 kubectl get pods,pvc -n demo -o wide
@@ -101,16 +101,15 @@ kubectl kustomize manifests/k8s-demo/overlays/strict \
 kubectl get pdb -n demo
 
 # Try to evict — HTTP 429: blocked by PDB
-kubectl create -f - <<'EOF'
-apiVersion: policy/v1
-kind: Eviction
-metadata:
-  name: demo-app-0
-  namespace: demo
-EOF
-# → error: Cannot evict pod as it would violate the pod's disruption budget
+kubectl proxy --port=38001 &
+curl -s -w "\nHTTP %{http_code}\n" -X POST \
+  http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"demo-app-0","namespace":"demo"}}'
+kill %1
+# → HTTP 429 Too Many Requests (PDB blocked it)
 
-# Try to drain — also blocked
+# Try to drain — also blocked by PDB
 NODE=$(kubectl get pods -n demo demo-app-0 -o jsonpath='{.spec.nodeName}')
 kubectl cordon "$NODE"
 kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --grace-period=30 --timeout=60s
@@ -374,16 +373,15 @@ kubectl exec -n demo demo-app-0 -- cat /data/marker.txt
 Manual eviction (same as `make evict` / `scripts/evict-pod.sh`):
 
 ```bash
-kubectl create -f - <<'EOF'
-apiVersion: policy/v1
-kind: Eviction
-metadata:
-  name: demo-app-0
-  namespace: demo
-spec:
-  deleteOptions:
-    gracePeriodSeconds: 30
-EOF
+# Eviction is a pod subresource — use kubectl proxy + curl
+kubectl proxy --port=38001 &
+curl -s -w "\nHTTP %{http_code}\n" -X POST \
+  http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"demo-app-0","namespace":"demo"}}'
+kill %1
+# Relaxed PDB → HTTP 201 Created (allowed)
+# Strict PDB  → HTTP 429 Too Many Requests (blocked)
 ```
 
 ### kubectl — strict (eviction blocked)
