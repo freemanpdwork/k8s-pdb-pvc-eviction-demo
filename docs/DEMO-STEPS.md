@@ -6,9 +6,9 @@ Condensed speaker reference for live demos. Full narrative and timing: **[DEMO.m
 
 | Track | ~time | Sections | Key commands |
 |-------|-------|----------|--------------|
-| **10 min** | 10m | [Quick demo — 3 concepts](#quick-demo--3-concepts-10-minutes) | `make setup` · `make demo-url` · `make evict` · `make pdb-strict` |
-| **30 min** | 30m | [Prep](#prep-before-the-room) · [1 GitOps](#1-gitops-deployment) · [3 PVC](#3-pvc-persistence) · [4 PDB](#4-pdb-protection) · [5 Eviction](#5-eviction-api) | `make preflight` · `make demo-data` · `make pdb-strict` · `make evict` |
-| **60 min** | 60m | [Suggested live order](#suggested-live-order) (sections 0–6) | `make argocd-pause-sync` · `make drain` · `make uncordon` · full cheat sheet below |
+| **10 min** | 10m | [Quick demo — 3 concepts](#quick-demo--3-concepts-10-minutes) | `make setup` · `make demo-url` · `make act-pvc` · `make act-pdb` |
+| **30 min** | 30m | [Prep](#prep-before-the-room) · [1 GitOps](#1-gitops-deployment) · [3 PVC](#3-pvc-persistence) · [4 PDB](#4-pdb-protection) · [5 Eviction](#5-eviction-api) | `make preflight` · `make act-pvc` · `make act-pdb` |
+| **60 min** | 60m | [Suggested live order](#suggested-live-order) (sections 0–6) | `make act-drain` · `make uncordon` · `make argocd-resume-sync` · full cheat sheet below |
 
 Run `make preflight` before the room — validates overlays, checks the cluster, probes GitHub reachability, and prints Argo CD (`:30080`) and demo app (`:30090`) URLs.
 
@@ -33,8 +33,8 @@ make setup          # cluster + Argo CD + demo-app synced + demo data
 make check-cluster  # context kind-pdb-pvc-demo, 4 nodes Ready
 make status         # pods spread, PVCs Bound, PDB present
 make preflight      # validate overlays + cluster + GitHub + print URLs
-# Before strict PDB / drain acts (GitOps setup only):
-make argocd-pause-sync   # disable selfHeal so make pdb-strict is not reverted
+# Optional before maintenance/drift acts:
+make argocd-pause-sync   # pause automated sync; manual argocd sync still works
 # Argo CD UI (preferred — no tunnel):
 open http://localhost:30080
 # Demo app HTTP (PVC data in browser — no tunnel):
@@ -45,7 +45,7 @@ make demo-url       # → http://localhost:30090/
 |------|---------|-------|
 | Bootstrap | `make setup` | Registers `demo-app` Application; waits Synced/Healthy |
 | Verify | `make check-cluster` | 1 control-plane + 3 workers Ready |
-| Pause sync | `make argocd-pause-sync` | **Before strict PDB acts** — prevents selfHeal revert (~3 min) |
+| Pause sync | `make argocd-pause-sync` | Set Application sync policy to manual for maintenance/drift demos |
 | Snapshot | `make status` | `demo-app-0` / `demo-app-1` on separate workers |
 | Preflight | `make preflight` | Overlays, cluster, GitHub reachability, URLs |
 | Argo CD UI | http://localhost:30080 | After `make argocd` / `make setup` — no login; `make argocd-expose` to re-apply |
@@ -69,9 +69,11 @@ Each step shows the **make shortcut** and the **raw kubectl** equivalent.
 
 **make shortcut**
 ```bash
+make act-pvc   # guided before/after: pod UID changes, same PVC marker survives
+# or step by step:
 make status    # show pods + PVCs + node placement
 make evict     # evict one pod via Eviction API (relaxed PDB allows it)
-make status    # pod rescheduled, PVC reattached, same data
+make status    # pod recreated, same PVC marker data
 ```
 
 **raw kubectl**
@@ -89,7 +91,7 @@ curl -s -w "\nHTTP %{http_code}\n" -X POST \
 kill %1   # stop the proxy
 # → HTTP 201 Created (eviction allowed)
 
-# Watch recreation and PVC reattachment
+# Watch recreation and PVC data
 kubectl get pods,pvc -n demo -o wide
 ```
 
@@ -101,18 +103,22 @@ kubectl get pods,pvc -n demo -o wide
 
 **make shortcut**
 ```bash
-make pdb-strict   # minAvailable: 2, ALLOWED DISRUPTIONS: 0 (2 replicas)
+make act-pdb      # guided strict PDB act: HTTP 429, pod UID unchanged
+# or step by step:
+make argocd-strict # Argo CD syncs strict PDB desired state
 make evict        # Eviction API returns HTTP 429 — blocked
-make drain        # kubectl drain also blocked by PDB
-make pdb-relaxed  # restore relaxed PDB
+make act-drain    # pause auto-sync, then cordon/drain blocked by PDB
+make argocd-relaxed # restore relaxed PDB desired state
 make uncordon     # uncordon the node drained above
+make argocd-resume-sync
 ```
 
-**raw kubectl**
+**raw Argo CD + kubectl**
 ```bash
-# Switch to strict PDB (minAvailable: 2 → ALLOWED DISRUPTIONS: 0 with 2 replicas)
-kubectl kustomize manifests/k8s-demo/overlays/strict \
-  --load-restrictor LoadRestrictionsNone | kubectl apply -f -
+# Switch desired state to strict PDB through Argo CD
+argocd --core app set demo-app -N argocd --path manifests/k8s-demo/overlays/strict
+argocd --core app sync demo-app -N argocd --prune
+argocd --core app wait demo-app -N argocd --sync --health
 kubectl get pdb -n demo
 
 # Try to evict — HTTP 429: blocked by PDB
@@ -130,8 +136,8 @@ kubectl cordon "$NODE"
 kubectl drain "$NODE" --ignore-daemonsets --delete-emptydir-data --grace-period=30 --timeout=60s
 
 # Restore: switch back to relaxed PDB and uncordon
-kubectl kustomize manifests/k8s-demo/overlays/relaxed \
-  --load-restrictor LoadRestrictionsNone | kubectl apply -f -
+argocd --core app set demo-app -N argocd --path manifests/k8s-demo
+argocd --core app sync demo-app -N argocd --prune
 kubectl uncordon "$NODE"
 ```
 
@@ -221,15 +227,19 @@ After section 6, run `make uncordon` if any node is cordoned. Relaxed PDB is the
 | `make argocd-expose` | Argo CD UI at http://localhost:30080 (preferred on kind/Mac) |
 | `make demo-expose` | Demo app HTTP at http://localhost:30090 (preferred on kind/Mac) |
 | `make demo-url` | Print demo app URL and apply NodePort if needed |
-| `make argocd-pause-sync` | Disable selfHeal before local `pdb-strict` / `pdb-relaxed` |
+| `make argocd-pause-sync` | Pause automated sync (manual mode) |
+| `make argocd-resume-sync` | Resume automated sync with prune + selfHeal |
+| `make argocd-relaxed` | Argo CD desired state: relaxed PDB |
+| `make argocd-strict` | Argo CD desired state: strict PDB |
 | `make argocd-resume-sync` | Restore automated sync from `manifests/argocd/application.yaml` |
 | `make port-forward` | Argo CD UI tunnel fallback (`ARGOCD_LOCAL_PORT`, default 8888) |
 | `make argocd-proxy` | kubectl proxy fallback for Argo CD UI |
 | `make demo-data` | Write `/data/marker.txt` on each pod's PVC |
 | `make evict` | Evict one Running pod via Eviction API |
-| `make pdb-relaxed` | `minAvailable: 1` — one voluntary disruption allowed |
-| `make pdb-strict` | `minAvailable: 2` — blocks voluntary eviction/drain |
+| `make pdb-relaxed` | Alias for `make argocd-relaxed` |
+| `make pdb-strict` | Alias for `make argocd-strict` |
 | `make drain` | Cordon + drain a worker running demo pods |
+| `make act-drain` | Pause auto-sync, sync strict desired state, then cordon/drain |
 | `make uncordon` | Uncordon all nodes (post-drain cleanup) |
 | `make deploy-direct` | Apply manifests via kubectl (offline, no git push) |
 | `make argocd-app` | Re-register Application + wait Synced/Healthy |
@@ -347,19 +357,18 @@ kubectl get pod -n demo demo-app-0 -o jsonpath='{.spec.volumes[?(@.persistentVol
 
 **Talking point:** PodDisruptionBudget gates *voluntary* disruption (evict, drain). Tune `minAvailable` for replica count and SLO — relaxed allows one pod down; strict allows zero.
 
-### kubectl — relaxed (default)
+### Argo CD — relaxed (default)
 
 ```bash
-make pdb-relaxed
+make argocd-relaxed
 kubectl get pdb -n demo demo-app-pdb -o wide
 kubectl get pdb -n demo demo-app-pdb -o jsonpath='minAvailable={.spec.minAvailable} allowed={.status.disruptionsAllowed}{"\n"}'
 ```
 
-### kubectl — strict
+### Argo CD — strict
 
 ```bash
-make argocd-pause-sync   # if GitOps setup — prevents selfHeal revert
-make pdb-strict
+make argocd-strict
 kubectl get pdb -n demo demo-app-pdb -o wide
 kubectl get pdb -n demo demo-app-pdb -o jsonpath='minAvailable={.spec.minAvailable} allowed={.status.disruptionsAllowed}{"\n"}'
 ```
@@ -378,6 +387,58 @@ kubectl get pdb -n demo demo-app-pdb -o jsonpath='minAvailable={.spec.minAvailab
 
 **Expected:** Relaxed PDB allows one voluntary disruption; strict PDB allows zero — any evict/drain attempt on demo pods will be blocked.
 
+### PDB YAML breakdown
+
+Show the YAML when you switch modes:
+
+```bash
+make pdb-explain
+# or inspect the files directly:
+sed -n '1,80p' manifests/k8s-demo/pdb-relaxed.yaml
+sed -n '1,80p' manifests/k8s-demo/pdb-strict.yaml
+kubectl describe pdb -n demo demo-app-pdb
+```
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: demo-app-pdb
+  namespace: demo
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: demo-app
+```
+
+| Field | What to say |
+|-------|-------------|
+| `apiVersion: policy/v1` | PDB is a policy API object; it is enforced by the Eviction API path used by drain/autoscaler-style maintenance. |
+| `metadata.name` | There is one PDB named `demo-app-pdb`; Argo CD swaps relaxed vs strict by changing the Application path. |
+| `spec.selector.matchLabels.app: demo-app` | The PDB only counts pods with this label. If labels drift or the selector is wrong, the budget may protect zero pods or the wrong pods. |
+| `spec.minAvailable: 1` | With 2 ready replicas, Kubernetes can allow 1 voluntary disruption. |
+| `spec.minAvailable: 2` | With 2 ready replicas, Kubernetes must keep both available, so `ALLOWED DISRUPTIONS=0`. |
+
+Useful status fields from `kubectl describe pdb`:
+
+| Status field | Why it matters |
+|--------------|----------------|
+| `Allowed disruptions` | The number the Eviction API uses for allow/block. `0` means HTTP 429 for demo pods. |
+| `Current Healthy` | Ready pods currently matching the selector. |
+| `Desired Healthy` | Minimum healthy pods required by the budget. |
+| `Expected Pods` | Pods selected by the PDB; should be `2` in the normal demo. |
+
+### PDB problems to call out
+
+| Problem | Symptom | Explanation / fix |
+|---------|---------|-------------------|
+| Strict PDB conflicts with replica count | `ALLOWED DISRUPTIONS=0`; drain/evict returns 429 | This is intentional in the strict act with 2 replicas and `minAvailable: 2`. If you accidentally run strict with fewer replicas, maintenance is also blocked. Restore with `make argocd-relaxed` or increase replicas. |
+| Selector does not match pods | `Expected Pods` is `0` or not `2` | PDB math only sees selected pods. Check `kubectl get pods -n demo --show-labels` and the PDB selector. |
+| Argo CD is Synced/Healthy but drain fails | Argo CD looks green; `kubectl drain` fails | This is not an Argo CD failure. Argo CD successfully applied desired state; the desired state says voluntary disruptions are not allowed. |
+| Argo CD path is not what you think | PDB mode does not match the story | Run `argocd --core app get demo-app -N argocd` and check the source path. Use `make argocd-relaxed` or `make argocd-strict`. |
+| Direct `kubectl delete pod` appears to ignore PDB | Pod disappears despite strict PDB | PDBs gate the Eviction API, not forced pod deletion. Use `make evict` or `make drain` to demonstrate enforcement. |
+
 ---
 
 ## 5. Eviction API
@@ -386,10 +447,10 @@ kubectl get pdb -n demo demo-app-pdb -o jsonpath='minAvailable={.spec.minAvailab
 
 > **Voluntary vs forced delete:** `kubectl delete pod` is **not** gated by PDB — it removes the pod immediately without consulting the Eviction API. `make evict`, `kubectl drain`, and cluster autoscaler scale-down all use the Eviction API and respect PDB. Do not use `kubectl delete` when demonstrating PDB blocks.
 
-### kubectl — relaxed (eviction succeeds)
+### Argo CD desired state + Eviction API — relaxed succeeds
 
 ```bash
-make pdb-relaxed
+make argocd-relaxed
 make evict
 make status
 make demo-data
@@ -410,10 +471,10 @@ kill %1
 # Strict PDB  → HTTP 429 Too Many Requests (blocked)
 ```
 
-### kubectl — strict (eviction blocked)
+### Argo CD desired state + Eviction API — strict blocks
 
 ```bash
-make pdb-strict
+make argocd-strict
 make evict
 ```
 
@@ -433,13 +494,12 @@ make evict
 
 ## 6. Cordon / drain / migrate
 
-**Talking point:** Node maintenance cordons the node, then drains pods via the Eviction API. Strict PDB blocks the whole drain; relaxed PDB allows one pod to move while the other stays up on the second worker.
+**Talking point:** Node maintenance cordons the node, then drains pods via the Eviction API. Strict PDB blocks the whole drain; relaxed PDB permits one eviction, but kind's node-local PV affinity may keep the replacement pod Pending until the storage node is uncordoned.
 
-### kubectl — strict PDB (drain blocked)
+### Argo CD desired state + kubectl drain — strict blocks
 
 ```bash
-make pdb-strict
-make drain
+make act-drain
 kubectl get nodes
 kubectl get events -n demo --sort-by='.lastTimestamp' | tail -15
 make status
@@ -454,10 +514,10 @@ kubectl drain "$NODE" \
   --ignore-daemonsets --delete-emptydir-data --grace-period=30 --timeout=120s
 ```
 
-### kubectl — relaxed PDB (migrate succeeds)
+### Argo CD relaxed desired state + drain contrast
 
 ```bash
-make pdb-relaxed
+make argocd-relaxed
 make uncordon
 make status
 make drain

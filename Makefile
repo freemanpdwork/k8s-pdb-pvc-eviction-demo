@@ -21,6 +21,9 @@ ARGOCD_PROXY_PORT ?= 8001
 ARGOCD_NODE_PORT  ?= 30080
 DEMO_NODE_PORT    ?= 30090
 ARGOCD_INSTALL    ?= https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+ARGOCD_APP        ?= demo-app
+ARGOCD_CLI        ?= argocd --core
+ARGOCD_APP_FLAGS  ?= -N $(ARGOCD_NS)
 
 RELAXED_KUSTOMIZE := manifests/k8s-demo/overlays/relaxed
 STRICT_KUSTOMIZE  := manifests/k8s-demo/overlays/strict
@@ -36,9 +39,10 @@ FMT_W     := \033[1;33m
 FMT_RESET := \033[0m
 
 .PHONY: help setup setup-offline preflight cluster cluster-delete check-cluster fix-context guard-context \
-        argocd argocd-expose argocd-password argocd-app argocd-wait argocd-pause-sync argocd-resume-sync \
+        argocd argocd-cli-check argocd-expose argocd-password argocd-app argocd-sync argocd-wait \
+        argocd-relaxed argocd-strict argocd-pause-sync argocd-resume-sync \
         port-forward argocd-proxy deploy deploy-direct deploy-strict pdb-relaxed pdb-strict \
-        demo-data demo-expose demo-url wait-ready status logs evict drain uncordon teardown clean \
+        pdb-explain demo-data demo-expose demo-url wait-ready status logs evict drain uncordon act-pvc act-pdb act-drain teardown clean \
         dry-run validate
 
 help: ## Show available targets
@@ -67,7 +71,7 @@ setup-offline: ## Bootstrap without GitOps (cluster + Argo CD + kubectl deploy +
 	@echo "Demo ready (offline). Argo CD UI: http://localhost:$(ARGOCD_NODE_PORT) (no Application registered — use make argocd-app for GitOps)"
 	@echo "Demo app HTTP: http://localhost:$(DEMO_NODE_PORT)/"
 
-preflight: validate check-cluster ## Validate overlays, verify cluster, GitHub reachability, print demo URLs
+preflight: validate check-cluster argocd-cli-check ## Validate overlays, verify cluster, GitHub reachability, print demo URLs
 	@repo="$(DEMO_REPO_URL)"; \
 	repo="$${repo%.git}"; \
 	owner_repo="$${repo##*github.com/}"; \
@@ -92,6 +96,15 @@ preflight: validate check-cluster ## Validate overlays, verify cluster, GitHub r
 	@printf '$(FMT_H)Demo URLs$(FMT_RESET)\n'
 	@printf '  Argo CD UI:    http://localhost:$(ARGOCD_NODE_PORT)  (no login)\n'
 	@printf '  Demo app HTTP: http://localhost:$(DEMO_NODE_PORT)/  (run make demo-expose if needed)\n'
+
+argocd-cli-check: ## Verify argocd CLI is installed for Argo CD-centered workflow
+	@command -v argocd >/dev/null || { \
+		echo "argocd CLI is required for the primary demo workflow." >&2; \
+		echo "Install: brew install argocd" >&2; \
+		exit 1; \
+	}
+	@printf '$(FMT_H)Argo CD CLI:$(FMT_RESET) '
+	@argocd version --client --short
 
 cluster: ## Create kind cluster if missing and export kubeconfig
 	@command -v kind >/dev/null || { echo "kind is required. Install: https://kind.sigs.k8s.io/" >&2; exit 1; }
@@ -316,62 +329,98 @@ deploy-strict: guard-context ## Apply strict PDB overlay via kubectl
 	@$(call kustomize_apply,$(STRICT_KUSTOMIZE))
 	@$(MAKE) wait-ready
 
-argocd-app: ## Register Argo CD Application and wait until Synced/Healthy
-	@printf '$(FMT_C)  $ kubectl apply (argocd/application.yaml → repoURL=$(DEMO_REPO_URL))$(FMT_RESET)\n'
-	@sed 's|DEMO_REPO_URL_PLACEHOLDER|$(DEMO_REPO_URL)|g' manifests/argocd/application.yaml | \
-		kubectl apply --server-side --force-conflicts -f -
-	@echo "Argo CD Application registered. repoURL=$(DEMO_REPO_URL)"
+argocd-app: check-cluster argocd-cli-check ## Create/update Argo CD Application and sync desired state
+	@printf '$(FMT_H)Creating/updating Argo CD Application $(ARGOCD_APP)...$(FMT_RESET)\n'
+	@printf '$(FMT_C)  $ $(ARGOCD_CLI) app create $(ARGOCD_APP) --repo $(DEMO_REPO_URL) --path $(DEMO_OVERLAY) --dest-server https://kubernetes.default.svc --dest-namespace $(NAMESPACE) --sync-policy automated --auto-prune --self-heal --upsert$(FMT_RESET)\n'
+	@$(ARGOCD_CLI) app create $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) \
+		--repo "$(DEMO_REPO_URL)" \
+		--revision main \
+		--path "$(DEMO_OVERLAY)" \
+		--dest-server https://kubernetes.default.svc \
+		--dest-namespace "$(NAMESPACE)" \
+		--project default \
+		--label app.kubernetes.io/part-of=demo-app \
+		--sync-policy automated \
+		--auto-prune \
+		--self-heal \
+		--sync-option CreateNamespace=true \
+		--set-finalizer \
+		--upsert
+	@echo "Argo CD Application registered. repoURL=$(DEMO_REPO_URL), path=$(DEMO_OVERLAY)"
+	@$(MAKE) argocd-sync
+
+argocd-sync: check-cluster argocd-cli-check ## Sync demo-app through Argo CD CLI and wait Healthy/Synced
+	@printf '$(FMT_H)Syncing $(ARGOCD_APP) through Argo CD...$(FMT_RESET)\n'
+	@printf '$(FMT_C)  $ $(ARGOCD_CLI) app sync $(ARGOCD_APP) --prune$(FMT_RESET)\n'
+	@$(ARGOCD_CLI) app sync $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) --prune --timeout 300
 	@$(MAKE) argocd-wait
 
-argocd-pause-sync: guard-context ## Disable Argo selfHeal before local PDB switches
-	@if ! kubectl get application demo-app -n $(ARGOCD_NS) >/dev/null 2>&1; then \
-		echo "No demo-app Application — nothing to pause (offline deploy uses make deploy-direct)." >&2; \
-		exit 0; \
-	fi
-	@printf '$(FMT_H)Pausing Argo CD selfHeal on demo-app...$(FMT_RESET)\n'
-	@kubectl patch application demo-app -n $(ARGOCD_NS) --type merge \
-		-p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":false}}}}'
-	@printf '$(FMT_W)selfHeal disabled — make pdb-strict / pdb-relaxed will not be reverted by Argo.$(FMT_RESET)\n'
-	@printf '$(FMT_W)Restore with: make argocd-resume-sync$(FMT_RESET)\n'
-
-argocd-resume-sync: guard-context ## Restore Argo automated sync from application.yaml
-	@printf '$(FMT_H)Restoring Argo CD automated sync from manifests/argocd/application.yaml...$(FMT_RESET)\n'
-	@sed 's|DEMO_REPO_URL_PLACEHOLDER|$(DEMO_REPO_URL)|g' manifests/argocd/application.yaml | \
-		kubectl apply --server-side --force-conflicts -f -
-	@printf '$(FMT_W)selfHeal restored — cluster will reconcile to git within ~3 min.$(FMT_RESET)\n'
-
-argocd-wait: check-cluster ## Wait for demo-app Application Synced and Healthy in Argo CD
-	@echo "Waiting for Argo CD to sync demo-app from $(DEMO_REPO_URL)..."
-	@echo "(Manifests must exist at $(DEMO_OVERLAY) in that repo — push your fork if using DEMO_REPO_URL override)"
-	@kubectl wait --for=jsonpath='{.status.sync.status}'=Synced application/demo-app -n $(ARGOCD_NS) --timeout=300s || { \
-		echo "ERROR: demo-app did not reach Synced within 300s." >&2; \
+argocd-wait: check-cluster argocd-cli-check ## Wait for demo-app Application Synced and Healthy in Argo CD
+	@echo "Waiting for Argo CD Application $(ARGOCD_APP) to become Synced and Healthy..."
+	@echo "(Manifests must exist at the configured repo/path — push your fork if using DEMO_REPO_URL override)"
+	@$(ARGOCD_CLI) app wait $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) --sync --health --timeout 300 || { \
+		echo "ERROR: $(ARGOCD_APP) did not reach Synced/Healthy within 300s." >&2; \
 		echo "Push manifests to $(DEMO_REPO_URL) or set DEMO_REPO_URL to a reachable repo." >&2; \
 		echo "Offline fallback: make deploy-direct" >&2; \
-		kubectl get application demo-app -n $(ARGOCD_NS) -o jsonpath='{.status.sync}{"\n"}' 2>/dev/null; \
+		$(ARGOCD_CLI) app get $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) 2>/dev/null || true; \
 		exit 1; \
 	}
-	@kubectl wait --for=jsonpath='{.status.health.status}'=Healthy application/demo-app -n $(ARGOCD_NS) --timeout=300s || { \
-		echo "ERROR: demo-app did not reach Healthy within 300s." >&2; \
-		echo "Offline fallback: make deploy-direct" >&2; \
-		kubectl get application demo-app -n $(ARGOCD_NS) -o jsonpath='{.status.health}{"\n"}' 2>/dev/null; \
-		exit 1; \
-	}
-	@echo "demo-app is Synced and Healthy."
+	@echo "$(ARGOCD_APP) is Synced and Healthy."
 
-pdb-relaxed: guard-context ## Switch to relaxed PDB (minAvailable: 1)
-	@printf '$(FMT_W)Note: Argo CD selfHeal reverts local PDB changes within ~3 min unless you run make argocd-pause-sync first.$(FMT_RESET)\n'
-	@printf '$(FMT_C)  $ kubectl kustomize $(RELAXED_KUSTOMIZE) | kubectl apply -f -$(FMT_RESET)\n'
-	@$(call kustomize_apply,$(RELAXED_KUSTOMIZE))
+argocd-relaxed: check-cluster argocd-cli-check ## Set Argo CD desired state to relaxed PDB and sync
+	@printf '$(FMT_H)Argo CD desired state: relaxed PDB$(FMT_RESET)\n'
+	@printf '$(FMT_C)  $ $(ARGOCD_CLI) app set $(ARGOCD_APP) --path $(DEMO_OVERLAY)$(FMT_RESET)\n'
+	@$(ARGOCD_CLI) app set $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) --path "$(DEMO_OVERLAY)"
+	@$(MAKE) argocd-sync
 	@printf '$(FMT_C)  $ kubectl get pdb -n $(NAMESPACE)$(FMT_RESET)\n'
 	@kubectl get pdb -n $(NAMESPACE)
 
-pdb-strict: guard-context ## Switch to strict PDB (minAvailable: 2) — blocks eviction/drain
-	@printf '$(FMT_W)Note: Argo CD selfHeal reverts local PDB changes within ~3 min unless you run make argocd-pause-sync first.$(FMT_RESET)\n'
-	@printf '$(FMT_C)  $ kubectl kustomize $(STRICT_KUSTOMIZE) | kubectl apply -f -$(FMT_RESET)\n'
-	@$(call kustomize_apply,$(STRICT_KUSTOMIZE))
+argocd-strict: check-cluster argocd-cli-check ## Set Argo CD desired state to strict PDB and sync
+	@printf '$(FMT_H)Argo CD desired state: strict PDB$(FMT_RESET)\n'
+	@printf '$(FMT_C)  $ $(ARGOCD_CLI) app set $(ARGOCD_APP) --path $(STRICT_OVERLAY)$(FMT_RESET)\n'
+	@$(ARGOCD_CLI) app set $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) --path "$(STRICT_OVERLAY)"
+	@$(MAKE) argocd-sync
 	@printf '$(FMT_C)  $ kubectl get pdb -n $(NAMESPACE)$(FMT_RESET)\n'
 	@kubectl get pdb -n $(NAMESPACE)
 	@printf '$(FMT_W)Strict PDB active (minAvailable: 2). ALLOWED DISRUPTIONS=0 when 2 replicas are running — eviction and drain will be blocked.$(FMT_RESET)\n'
+
+argocd-pause-sync: check-cluster argocd-cli-check ## Pause automated sync (manual mode) for maintenance/drift demos
+	@if ! kubectl get application $(ARGOCD_APP) -n $(ARGOCD_NS) >/dev/null 2>&1; then \
+		echo "No $(ARGOCD_APP) Application — create it with make argocd-app." >&2; \
+		exit 0; \
+	fi
+	@printf '$(FMT_H)Pausing automated sync for $(ARGOCD_APP)...$(FMT_RESET)\n'
+	@$(ARGOCD_CLI) app set $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) --sync-policy manual
+	@printf '$(FMT_W)Automated sync is paused. Manual Argo CD sync still works with: make argocd-sync$(FMT_RESET)\n'
+	@printf '$(FMT_W)Restore automated prune/selfHeal with: make argocd-resume-sync$(FMT_RESET)\n'
+
+argocd-resume-sync: check-cluster argocd-cli-check ## Resume automated Argo CD sync with prune + selfHeal
+	@printf '$(FMT_H)Resuming automated sync for $(ARGOCD_APP)...$(FMT_RESET)\n'
+	@$(ARGOCD_CLI) app set $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) \
+		--sync-policy automated \
+		--auto-prune \
+		--self-heal
+	@printf '$(FMT_W)Automated sync restored — Argo CD will reconcile drift to the selected repo path.$(FMT_RESET)\n'
+
+pdb-relaxed: argocd-relaxed ## Alias: switch to relaxed PDB through Argo CD
+
+pdb-strict: argocd-strict ## Alias: switch to strict PDB through Argo CD
+
+pdb-explain: ## Show PDB YAML variants and current live PDB status
+	@printf '$(FMT_H)Relaxed PDB YAML ($(RELAXED_KUSTOMIZE))$(FMT_RESET)\n'
+	@sed -n '1,80p' manifests/k8s-demo/pdb-relaxed.yaml
+	@echo ""
+	@printf '$(FMT_H)Strict PDB YAML ($(STRICT_OVERLAY))$(FMT_RESET)\n'
+	@sed -n '1,80p' manifests/k8s-demo/pdb-strict.yaml
+	@echo ""
+	@printf '$(FMT_H)Live PDB status$(FMT_RESET)\n'
+	@if kubectl get pdb demo-app-pdb -n $(NAMESPACE) >/dev/null 2>&1; then \
+		kubectl get pdb demo-app-pdb -n $(NAMESPACE) -o wide; \
+		echo ""; \
+		kubectl describe pdb demo-app-pdb -n $(NAMESPACE); \
+	else \
+		echo "No live PDB found in namespace $(NAMESPACE). Run make setup first for live status."; \
+	fi
 
 demo-data: guard-context wait-ready ## Write unique marker files to each pod's PVC at /data
 	@./scripts/write-data.sh
@@ -405,7 +454,7 @@ demo-expose: check-cluster ## Expose demo-app HTTP via NodePort (DEMO_NODE_PORT,
 		kubectl apply -f -
 	@echo ""
 	@printf '$(FMT_H)Demo app HTTP:$(FMT_RESET) http://localhost:$(DEMO_NODE_PORT)/\n'
-	@echo "  http://localhost:$(DEMO_NODE_PORT)/           → index.html (pod name, PVC, node)"
+	@echo "  http://localhost:$(DEMO_NODE_PORT)/           → PVC marker dashboard"
 	@echo "  http://localhost:$(DEMO_NODE_PORT)/marker.txt → raw PVC marker file"
 	@echo "Note: existing clusters need 'make cluster-delete && make cluster' for host port mapping"
 
@@ -420,6 +469,27 @@ evict: ## Evict one demo pod (shows PDB allow/block)
 
 drain: ## Cordon and drain a worker running demo pods
 	@./scripts/drain-node.sh || true
+
+act-pvc: guard-context ## Guided act: PVC data survives eviction/recreation
+	@$(MAKE) argocd-relaxed
+	@$(MAKE) demo-expose
+	@$(MAKE) wait-ready
+	@$(MAKE) demo-data
+	@./scripts/act-pvc.sh
+
+act-pdb: guard-context ## Guided act: strict PDB blocks voluntary eviction
+	@$(MAKE) wait-ready
+	@./scripts/act-pdb.sh
+
+act-drain: guard-context ## Guided act: pause Argo auto-sync, then strict PDB blocks drain
+	@$(MAKE) argocd-pause-sync
+	@$(MAKE) argocd-strict
+	@./scripts/drain-node.sh || true
+	@echo ""
+	@printf '$(FMT_H)Recent demo events$(FMT_RESET)\n'
+	@kubectl get events -n $(NAMESPACE) --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || true
+	@echo ""
+	@printf '$(FMT_W)Restore after this act: make uncordon && make argocd-relaxed && make argocd-resume-sync$(FMT_RESET)\n'
 
 uncordon: ## Uncordon all nodes (post-drain cleanup)
 	@for node in $$(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do \

@@ -338,11 +338,12 @@ make cluster && make argocd && make deploy-direct && make demo-data
 Re-register or re-sync the Application manually:
 
 ```bash
-make argocd-app      # apply local manifests/argocd/application.yaml + wait for Synced/Healthy
+make argocd-app      # create/update Application through argocd CLI + wait for Synced/Healthy
+make argocd-sync     # sync through argocd CLI
 make argocd-wait     # wait only (Application must already exist)
 ```
 
-`make argocd-app` substitutes `DEMO_REPO_URL` and applies `manifests/argocd/application.yaml` from this repo — it does not pull the Application definition from GitHub.
+`make argocd-app` uses `argocd --core`, so no Argo CD login is required. The Application still points at `DEMO_REPO_URL`; Argo CD owns the deployed Kubernetes resources.
 
 ### GitOps vs local deploy
 
@@ -350,11 +351,12 @@ make argocd-wait     # wait only (Application must already exist)
 |--------|-------------|
 | `make setup` | **Recommended** — cluster + Argo CD + GitOps sync + demo data |
 | `make deploy` / `make deploy-direct` | **Local offline demo** — kubectl apply, no git push |
-| `make argocd-app` | Re-register Application and wait for sync (also runs during `make setup`) |
-| `make pdb-strict` | Switch to strict PDB without git (kubectl) |
-| `make deploy-strict` | Full strict overlay apply |
+| `make argocd-app` | Create/update Application through Argo CD CLI and sync |
+| `make argocd-relaxed` / `make argocd-strict` | Point the Argo CD Application at relaxed/strict desired state and sync |
+| `make pdb-relaxed` / `make pdb-strict` | Backward-compatible aliases for the Argo CD targets |
+| `make deploy-strict` | Offline kubectl fallback only |
 
-For local-only demos, `make pdb-strict` and `make pdb-relaxed` switch PDB policy instantly without git. Run `make argocd-pause-sync` first if Argo CD is managing the app — otherwise selfHeal reverts PDB changes within ~3 minutes.
+For the primary demo, use Argo CD targets for desired-state changes. `kubectl` is used for observation and operational actions such as eviction, cordon, and drain.
 
 ## Demo flow (summary)
 
@@ -362,11 +364,12 @@ For local-only demos, `make pdb-strict` and `make pdb-relaxed` switch PDB policy
 
 1. **Full bootstrap** — `make setup` (cluster + Argo CD + `demo-app` synced via GitOps); open http://localhost:30080 (no login)
 2. **k9s tour** — pods spread across workers, PVCs bound
-3. **PVC persistence** — `make demo-data`, restart pod, marker survives on `/data`
+3. **PVC persistence** — `make act-pvc`, pod UID changes while the PVC marker survives on `/data`
 4. **Relaxed PDB** — `make evict` succeeds (minAvailable: 1)
-5. **Git rollout** — change overlay, push, Argo sync (or `make deploy-direct`)
-6. **Strict PDB** — `make pdb-strict`, `make evict` / `make drain` blocked
-7. **Drift self-heal** — kubectl edit pod, Argo restores desired state
+5. **Git rollout** — change overlay, push, `make argocd-sync`
+6. **Strict PDB** — `make act-pdb`, Argo CD syncs strict desired state, Eviction API returns 429
+7. **Maintenance** — `make act-drain`, pause automated sync, cordon/drain, PDB blocks eviction
+8. **Drift self-heal** — kubectl edit pod, Argo restores desired state after `make argocd-resume-sync`
 
 ## k9s cheat sheet
 
@@ -416,14 +419,22 @@ make demo-url        # Print demo app URL and apply NodePort if needed
 make port-forward    # Argo CD UI tunnel fallback (http://127.0.0.1:8888)
 make argocd-proxy    # kubectl proxy fallback for Argo CD UI
 make argocd-password # Initial admin password (CLI only)
-make argocd-app      # Register demo-app Application + wait for sync
+make argocd-cli-check # Verify argocd CLI is installed
+make argocd-app      # Create/update demo-app Application through argocd CLI
+make argocd-sync     # Sync demo-app through argocd CLI
 make argocd-wait     # Wait for demo-app Synced/Healthy
-make argocd-pause-sync  # Disable selfHeal before local PDB switches
-make argocd-resume-sync # Restore automated sync from application.yaml
+make argocd-relaxed  # Argo CD desired state: relaxed PDB
+make argocd-strict   # Argo CD desired state: strict PDB
+make argocd-pause-sync  # Pause automated sync (manual mode)
+make argocd-resume-sync # Resume automated sync with prune + selfHeal
 make deploy          # Apply relaxed overlay (offline kubectl)
 make demo-data       # Write PVC markers
-make pdb-strict      # Strict PDB (blocks eviction)
-make pdb-relaxed     # Relaxed PDB (allows one eviction)
+make act-pvc         # Guided PVC act: pod recreated, marker survives
+make act-pdb         # Guided PDB act: strict PDB blocks eviction
+make act-drain       # Guided maintenance act: pause sync + cordon/drain
+make pdb-explain     # Show PDB YAML variants + live status math
+make pdb-strict      # Alias for make argocd-strict
+make pdb-relaxed     # Alias for make argocd-relaxed
 make evict           # Evict a pod via API
 make drain           # Cordon + drain node (PDB demo)
 make status          # Resource overview

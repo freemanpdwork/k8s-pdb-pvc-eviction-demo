@@ -28,16 +28,18 @@ make demo-url        # → http://localhost:30090/  (nginx serves PVC data; no t
 kubectl apply -f manifests/k8s-demo/demo-nodeport.yaml
 ```
 
-Open **http://localhost:30090/** in a browser. It shows which pod served the request, which PVC is mounted, which node the pod is on, and when the data was last written. This page is the visual anchor for the next two concepts.
+Open **http://localhost:30090/** in a browser. It shows pod identity, the mounted PVC, the marker timestamp, and the node where the marker page was written. This page is the visual anchor for the next two concepts.
 
 ---
 
 ### Concept 1 — PVC persistence: data survives eviction (~3 min)
 
-**Talking point:** The PVC is not the pod. Data at `/data` lives on a persistent volume; the pod is just a consumer. Evict the pod, reschedule it — same data comes back.
+**Talking point:** The PVC is not the pod. Data at `/data` lives on a persistent volume; the pod is just a consumer. Evict the pod, recreate it — the pod object changes, but the same claim and data come back.
 
 **make shortcut**
 ```bash
+make act-pvc         # guided before/after: pod UID changes, PVC marker survives
+# or step by step:
 make status          # pods on separate nodes, PVCs Bound, PDB relaxed
 make demo-data       # write marker.txt + index.html to each pod's /data
 ```
@@ -69,14 +71,14 @@ curl -s -w "\nHTTP %{http_code}\n" -X POST \
 kill %1
 # → HTTP 201 Created (eviction allowed)
 
-# Verify pod rescheduled and PVC reattached
+# Verify pod recreated and PVC data survived
 kubectl get pods,pvc -n demo -o wide
 kubectl exec -n demo demo-app-0 -- cat /data/marker.txt
 ```
 
-Refresh **http://localhost:30090/** — same write timestamp, possibly a different node listed. The PVC followed the pod.
+Refresh **http://localhost:30090/** — the marker timestamp stays the same after the pod object is recreated. With kind's `local-path-provisioner`, the PV has node affinity, so the replacement pod is often scheduled back to the storage node instead of the disk moving freely.
 
-**Key point:** the browser tab never needed to know the pod moved. The PVC reattached automatically.
+**Key point:** the workload identity and claim are stable even though the pod object is disposable.
 
 ---
 
@@ -86,15 +88,18 @@ Refresh **http://localhost:30090/** — same write timestamp, possibly a differe
 
 **make shortcut**
 ```bash
-make pdb-strict      # minAvailable: 2, ALLOWED DISRUPTIONS: 0 with 2 replicas
+make act-pdb         # guided strict PDB act: HTTP 429, pod UID unchanged
+# or step by step:
+make argocd-strict   # Argo CD syncs strict desired state
 make evict           # Eviction API → HTTP 429 Too Many Requests — pod NOT deleted
 ```
 
-**raw kubectl**
+**raw Argo CD + kubectl**
 ```bash
-# Switch to strict PDB (minAvailable: 2 → ALLOWED DISRUPTIONS: 0 with 2 replicas)
-kubectl kustomize manifests/k8s-demo/overlays/strict \
-  --load-restrictor LoadRestrictionsNone | kubectl apply -f -
+# Switch desired state to strict PDB through Argo CD
+argocd --core app set demo-app -N argocd --path manifests/k8s-demo/overlays/strict
+argocd --core app sync demo-app -N argocd --prune
+argocd --core app wait demo-app -N argocd --sync --health
 kubectl get pdb -n demo
 
 # Try to evict — HTTP 429: blocked by PDB
@@ -111,7 +116,7 @@ Show the 429 output from the terminal. Refresh **http://localhost:30090/** — s
 
 **make shortcut**
 ```bash
-make drain           # cordon + drain a worker — drain also blocked by PDB
+make act-drain       # pause auto-sync, ensure strict desired state, cordon + drain
 make status          # node cordoned (SchedulingDisabled), pods untouched
 ```
 
@@ -128,14 +133,15 @@ Restore:
 
 **make shortcut**
 ```bash
-make pdb-relaxed     # restore 1 allowed disruption
+make argocd-relaxed  # restore relaxed desired state through Argo CD
 make uncordon        # restore cordoned node
+make argocd-resume-sync
 ```
 
-**raw kubectl**
+**raw Argo CD + kubectl**
 ```bash
-kubectl kustomize manifests/k8s-demo/overlays/relaxed \
-  --load-restrictor LoadRestrictionsNone | kubectl apply -f -
+argocd --core app set demo-app -N argocd --path manifests/k8s-demo
+argocd --core app sync demo-app -N argocd --prune
 kubectl uncordon "$NODE"
 kubectl get pdb -n demo   # ALLOWED DISRUPTIONS: 1
 ```
@@ -255,7 +261,7 @@ make argocd-app    # applies local manifests/argocd/application.yaml (not from g
 `make cluster` creates **1 control-plane + 3 workers** (`kind/cluster.yaml`). That gives you:
 
 - **Pod spread** — StatefulSet pod anti-affinity prefers different workers; `make status` should show `demo-app-0` and `demo-app-1` on separate nodes.
-- **Drain demo (Act 7)** — cordon and drain a worker that runs one demo pod; strict PDB blocks eviction; relaxed PDB allows one pod to move while the other stays on the second worker.
+- **Drain demo (Act 7)** — cordon and drain a worker that runs one demo pod; strict PDB blocks eviction; relaxed PDB permits eviction, then kind's node-local PV affinity may keep the replacement pod Pending until the node is uncordoned.
 
 Contrast with production: anti-affinity is *preferred*, not guaranteed — mention that on single-node clusters both pods may co-locate.
 
@@ -302,7 +308,7 @@ Call out **pod spread across workers** — this is why we use kind instead of a 
 
 ## Act 3 — PVC persistence (8 min)
 
-**Talking points:** Data lives on the PVC at `/data`, not the container filesystem. Eviction/reschedule reattaches the same PVC.
+**Talking points:** Data lives on the PVC at `/data`, not the container filesystem. Eviction recreates the pod object while the same PVC and marker data remain.
 
 ```bash
 make demo-data
@@ -343,7 +349,7 @@ make status
 make demo-data    # confirm markers on recreated pod
 ```
 
-**Expected:** Eviction succeeds. StatefulSet recreates pod. PVC rebinds. PDB shows `ALLOWED DISRUPTIONS: 1`.
+**Expected:** Eviction succeeds. StatefulSet recreates the pod with a new UID. The same PVC and marker data remain. PDB shows `ALLOWED DISRUPTIONS: 1`.
 
 Sample eviction manifest (what `kubectl evict` sends):
 
@@ -392,16 +398,34 @@ make deploy-direct
 
 **Talking points:** `minAvailable: 2` with 2 replicas means **zero** voluntary disruptions allowed. Eviction API returns 429.
 
-**Option A — GitOps:** Change Argo CD Application path to `manifests/k8s-demo/overlays/strict`, commit `pdb-strict.yaml`, push.
-
-**Option B — Local:**
+Set the Application path and sync through Argo CD:
 
 ```bash
-make pdb-strict
+make argocd-strict
 kubectl get pdb -n demo demo-app-pdb
 ```
 
 **Expected PDB:** `minAvailable: 2`, `ALLOWED DISRUPTIONS: 0`
+
+Pause on the YAML before the eviction:
+
+```bash
+make pdb-explain
+# or inspect the strict file directly:
+sed -n '1,80p' manifests/k8s-demo/pdb-strict.yaml
+kubectl describe pdb -n demo demo-app-pdb
+```
+
+What matters:
+
+| YAML/status | Talking point |
+|-------------|---------------|
+| `selector.matchLabels.app: demo-app` | The PDB only protects pods matching this label. If the selector does not match the StatefulSet pods, the budget math is meaningless. |
+| `minAvailable: 2` | With exactly 2 replicas, both must stay available. That leaves zero voluntary disruptions. |
+| `Allowed disruptions: 0` | This is the live decision value behind the HTTP 429. |
+| `Expected Pods: 2` | Confirms the PDB is counting the intended pods. |
+
+Problem to call out: Argo CD can be **Synced / Healthy** while the cluster refuses a drain. That is not a contradiction. Argo CD successfully applied the desired policy; the policy says this workload currently has no voluntary disruption budget available.
 
 Try eviction:
 
@@ -417,10 +441,10 @@ make evict
 
 **Talking points:** `kubectl drain` uses the eviction API for each pod. PDB blocks the whole drain when no disruptions are allowed.
 
-With **3 workers**, drain the worker running a demo pod — with strict PDB (`ALLOWED DISRUPTIONS: 0`) the eviction is refused. With relaxed PDB the pod is evicted from the cordoned worker, but on kind's `local-path-provisioner` the PV has required node affinity — the pod stays **Pending** on another worker until you `make uncordon`, because the PVC does not migrate across nodes.
+With **3 workers**, pause automated sync, sync strict desired state manually, then drain the worker running a demo pod. With strict PDB (`ALLOWED DISRUPTIONS: 0`) the eviction is refused. With relaxed PDB the pod is evicted from the cordoned worker, but on kind's `local-path-provisioner` the PV has required node affinity — the pod stays **Pending** on another worker until you `make uncordon`, because the PVC does not migrate across nodes.
 
 ```bash
-make drain
+make act-drain
 ```
 
 **Expected:**
@@ -441,12 +465,13 @@ make status
 Fix for next act:
 
 ```bash
-make pdb-relaxed
+make argocd-relaxed
 make uncordon
+make argocd-resume-sync
 make status
 ```
 
-Retry drain with relaxed PDB — one pod on the cordoned worker is evicted, but `local-path` node affinity keeps it **Pending** until `make uncordon`; the other pod on a different worker stays Running.
+Retry drain with relaxed PDB if you want to show the contrast — one pod on the cordoned worker is evicted, but `local-path` node affinity keeps it **Pending** until `make uncordon`; the other pod on a different worker stays Running.
 
 ---
 
