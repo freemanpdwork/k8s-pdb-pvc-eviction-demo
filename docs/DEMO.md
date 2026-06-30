@@ -2,6 +2,8 @@
 
 **Command cheat sheet:** [DEMO-STEPS.md](DEMO-STEPS.md) — copy-paste kubectl commands, k9s views, and Makefile shortcuts for live demos.
 
+**Drain workflow deep-dive:** [DEMO-DRAIN-WORKFLOW.md](DEMO-DRAIN-WORKFLOW.md) — cordon → Eviction API → PDB → EndpointSlice → StatefulSet replacement, with Argo CD pause/resume.
+
 **Audience:** Platform / SRE engineers  
 **Duration:** ~45–60 minutes (or ~10 minutes with the quick demo below)  
 **Cluster:** kind (`kind-pdb-pvc-demo` context, 1 control-plane + 3 workers)
@@ -64,6 +66,7 @@ make evict           # Eviction API → HTTP 201 Created (relaxed PDB allows it)
 ```bash
 # Eviction is a pod subresource — use kubectl proxy + curl
 kubectl proxy --port=38001 &
+until curl -sf http://localhost:38001/healthz >/dev/null; do sleep 0.2; done
 curl -s -w "\nHTTP %{http_code}\n" -X POST \
   http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
   -H 'Content-Type: application/json' \
@@ -104,6 +107,7 @@ kubectl get pdb -n demo
 
 # Try to evict — HTTP 429: blocked by PDB
 kubectl proxy --port=38001 &
+until curl -sf http://localhost:38001/healthz >/dev/null; do sleep 0.2; done
 curl -s -w "\nHTTP %{http_code}\n" -X POST \
   http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
   -H 'Content-Type: application/json' \
@@ -267,9 +271,28 @@ Contrast with production: anti-affinity is *preferred*, not guaranteed — menti
 
 ---
 
+## Listing Kubernetes APIs (optional warm-up)
+
+**Talking point:** Before eviction and drain acts, show how the API server advertises its surface area. Creatable kinds appear in `kubectl api-resources`; voluntary disruption uses a **pod subresource** that does not get its own row.
+
+```bash
+kubectl api-versions | sort
+kubectl api-resources --api-group=policy          # PodDisruptionBudget (policy/v1)
+kubectl api-resources --api-group=apps | grep statefulset
+kubectl api-resources --api-group=discovery.k8s.io  # EndpointSlice
+kubectl get --raw /apis
+kubectl get --raw /apis/policy/v1/namespaces/demo/poddisruptionbudgets
+```
+
+**Eviction tie-in:** `make evict` and `kubectl drain` POST to `/api/v1/namespaces/demo/pods/{name}/eviction` with `apiVersion: policy/v1` and `kind: Eviction`. The PDB controller returns HTTP **201** (allowed) or **429** (blocked). `kubectl delete pod` skips this path entirely.
+
+Full command list and table: [DEMO-STEPS.md — API discovery](DEMO-STEPS.md#api-discovery-optional-warm-up). Drain workflow APIs and observation stages: [DEMO-DRAIN-WORKFLOW.md](DEMO-DRAIN-WORKFLOW.md#api-discovery--see-the-objects-behind-the-flow).
+
+---
+
 ## Act 1 — Cluster & Argo CD (5 min)
 
-**Talking points:** kind gives a realistic multi-node topology on a laptop. Argo CD watches git and reconciles cluster state.
+**Talking points:** kind gives a realistic multi-node topology on a laptop. Argo CD watches git and reconciles cluster state. Optional warm-up: run the [API discovery commands](DEMO-STEPS.md#api-discovery-optional-warm-up) from DEMO-STEPS to show `api-resources`, `api-versions`, and `kubectl get --raw /apis` before eviction acts.
 
 ```bash
 make setup          # or: make cluster && make argocd && make argocd-app
@@ -441,7 +464,11 @@ make evict
 
 **Talking points:** `kubectl drain` uses the eviction API for each pod. PDB blocks the whole drain when no disruptions are allowed.
 
+**Extended guide:** [DEMO-DRAIN-WORKFLOW.md](DEMO-DRAIN-WORKFLOW.md) — full flow diagram (cordon → Eviction API → PDB → EndpointSlice → StatefulSet replacement), observation commands at each stage, and Argo CD pause/resume (UI + CLI + `kubectl patch`).
+
 With **3 workers**, pause automated sync, sync strict desired state manually, then drain the worker running a demo pod. With strict PDB (`ALLOWED DISRUPTIONS: 0`) the eviction is refused. With relaxed PDB the pod is evicted from the cordoned worker, but on kind's `local-path-provisioner` the PV has required node affinity — the pod stays **Pending** on another worker until you `make uncordon`, because the PVC does not migrate across nodes.
+
+> **Workload note:** This repo uses a **StatefulSet** controller to recreate pods — not a Deployment/ReplicaSet. Eviction and PDB behavior are the same; only the owning controller differs.
 
 ```bash
 make act-drain

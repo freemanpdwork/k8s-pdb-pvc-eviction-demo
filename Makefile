@@ -16,14 +16,16 @@ DEMO_REPO_URL   ?= https://github.com/freemanpdwork/k8s-pdb-pvc-eviction-demo.gi
 DEMO_OVERLAY    ?= manifests/k8s-demo
 STRICT_OVERLAY  ?= manifests/k8s-demo/overlays/strict
 ARGOCD_NS         ?= argocd
+export ARGOCD_NAMESPACE := $(ARGOCD_NS)
 ARGOCD_LOCAL_PORT ?= 8888
 ARGOCD_PROXY_PORT ?= 8001
 ARGOCD_NODE_PORT  ?= 30080
 DEMO_NODE_PORT    ?= 30090
 ARGOCD_INSTALL    ?= https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 ARGOCD_APP        ?= demo-app
-ARGOCD_CLI        ?= argocd --core
+ARGOCD_CLI        ?= argocd --core --argocd-namespace $(ARGOCD_NS)
 ARGOCD_APP_FLAGS  ?= -N $(ARGOCD_NS)
+ARGOCD_APP_MANIFEST ?= manifests/argocd/application.yaml
 
 RELAXED_KUSTOMIZE := manifests/k8s-demo/overlays/relaxed
 STRICT_KUSTOMIZE  := manifests/k8s-demo/overlays/strict
@@ -42,7 +44,7 @@ FMT_RESET := \033[0m
         argocd argocd-cli-check argocd-expose argocd-password argocd-app argocd-sync argocd-wait \
         argocd-relaxed argocd-strict argocd-pause-sync argocd-resume-sync \
         port-forward argocd-proxy deploy deploy-direct deploy-strict pdb-relaxed pdb-strict \
-        pdb-explain demo-data demo-expose demo-url wait-ready status logs evict drain uncordon act-pvc act-pdb act-drain teardown clean \
+        pdb-explain demo-data demo-expose demo-url demo-drain-doc wait-ready status logs evict drain uncordon act-pvc act-pdb act-drain teardown clean \
         dry-run validate
 
 help: ## Show available targets
@@ -274,6 +276,10 @@ argocd: check-cluster ## Install Argo CD and wait for server ready
 	@kubectl rollout status deployment/argocd-server -n $(ARGOCD_NS) --timeout=300s
 	@kubectl rollout status deployment/argocd-repo-server -n $(ARGOCD_NS) --timeout=300s
 	@kubectl rollout status deployment/argocd-applicationset-controller -n $(ARGOCD_NS) --timeout=300s 2>/dev/null || true
+	@kubectl get configmap argocd-cm -n $(ARGOCD_NS) >/dev/null 2>&1 || { \
+		echo "ERROR: argocd-cm ConfigMap missing in namespace $(ARGOCD_NS) after install." >&2; \
+		exit 1; \
+	}
 	@$(MAKE) argocd-expose
 
 argocd-expose: check-cluster ## Expose Argo CD UI via NodePort (ARGOCD_NODE_PORT, default 30080)
@@ -330,9 +336,14 @@ deploy-strict: guard-context ## Apply strict PDB overlay via kubectl
 	@$(MAKE) wait-ready
 
 argocd-app: check-cluster argocd-cli-check ## Create/update Argo CD Application and sync desired state
+	@kubectl get configmap argocd-cm -n $(ARGOCD_NS) >/dev/null 2>&1 || { \
+		echo "Argo CD is not installed (configmap argocd-cm missing in namespace $(ARGOCD_NS))." >&2; \
+		echo "Run: make argocd" >&2; \
+		exit 1; \
+	}
 	@printf '$(FMT_H)Creating/updating Argo CD Application $(ARGOCD_APP)...$(FMT_RESET)\n'
 	@printf '$(FMT_C)  $ $(ARGOCD_CLI) app create $(ARGOCD_APP) --repo $(DEMO_REPO_URL) --path $(DEMO_OVERLAY) --dest-server https://kubernetes.default.svc --dest-namespace $(NAMESPACE) --sync-policy automated --auto-prune --self-heal --upsert$(FMT_RESET)\n'
-	@$(ARGOCD_CLI) app create $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) \
+	@if $(ARGOCD_CLI) app create $(ARGOCD_APP) $(ARGOCD_APP_FLAGS) \
 		--repo "$(DEMO_REPO_URL)" \
 		--revision main \
 		--path "$(DEMO_OVERLAY)" \
@@ -345,9 +356,20 @@ argocd-app: check-cluster argocd-cli-check ## Create/update Argo CD Application 
 		--self-heal \
 		--sync-option CreateNamespace=true \
 		--set-finalizer \
-		--upsert
-	@echo "Argo CD Application registered. repoURL=$(DEMO_REPO_URL), path=$(DEMO_OVERLAY)"
-	@$(MAKE) argocd-sync
+		--upsert; then \
+		echo "Argo CD Application registered via CLI. repoURL=$(DEMO_REPO_URL), path=$(DEMO_OVERLAY)"; \
+		$(MAKE) argocd-sync; \
+	else \
+		echo "WARNING: argocd CLI failed — applying $(ARGOCD_APP_MANIFEST) via kubectl..." >&2; \
+		sed 's|DEMO_REPO_URL_PLACEHOLDER|$(DEMO_REPO_URL)|g' $(ARGOCD_APP_MANIFEST) | \
+			kubectl apply --server-side --force-conflicts -f -; \
+		echo "Application applied via kubectl. repoURL=$(DEMO_REPO_URL), path=$(DEMO_OVERLAY)"; \
+		kubectl wait --for=jsonpath='{.status.sync.status}'=Synced \
+			application/$(ARGOCD_APP) -n $(ARGOCD_NS) --timeout=300s; \
+		kubectl wait --for=jsonpath='{.status.health.status}'=Healthy \
+			application/$(ARGOCD_APP) -n $(ARGOCD_NS) --timeout=300s; \
+		echo "$(ARGOCD_APP) is Synced and Healthy."; \
+	fi
 
 argocd-sync: check-cluster argocd-cli-check ## Sync demo-app through Argo CD CLI and wait Healthy/Synced
 	@printf '$(FMT_H)Syncing $(ARGOCD_APP) through Argo CD...$(FMT_RESET)\n'
@@ -459,6 +481,11 @@ demo-expose: check-cluster ## Expose demo-app HTTP via NodePort (DEMO_NODE_PORT,
 	@echo "Note: existing clusters need 'make cluster-delete && make cluster' for host port mapping"
 
 demo-url: demo-expose ## Print demo-app HTTP URL (NodePort $(DEMO_NODE_PORT); no tunnel)
+
+demo-drain-doc: ## Print path to drain workflow doc (cordon → eviction → PDB → replacement)
+	@echo "Drain workflow guide: docs/DEMO-DRAIN-WORKFLOW.md"
+	@echo "  make act-drain  — pause sync, strict PDB, cordon + drain"
+	@echo "  make uncordon && make argocd-relaxed && make argocd-resume-sync  — restore"
 
 logs: ## Tail logs from demo-app pods
 	@printf '$(FMT_C)  $ kubectl logs -n $(NAMESPACE) -l app=demo-app --tail=50 --prefix=true$(FMT_RESET)\n'

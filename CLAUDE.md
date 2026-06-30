@@ -107,6 +107,7 @@ Once a StatefulSet is created, `.spec.selector` cannot be changed. Do not remove
 The Eviction resource is a **pod subresource** at `/api/v1/namespaces/{ns}/pods/{name}/eviction`. It does not appear in `kubectl api-resources` and cannot be mapped by `kubectl create`. Always use:
 ```bash
 kubectl proxy --port=38001 &
+until curl -sf http://localhost:38001/healthz >/dev/null; do sleep 0.2; done
 curl -s -w "\nHTTP %{http_code}\n" -X POST \
   http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
   -H 'Content-Type: application/json' \

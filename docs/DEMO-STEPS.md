@@ -1,6 +1,6 @@
 # Demo steps — command cheat sheet
 
-Condensed speaker reference for live demos. Full narrative and timing: **[DEMO.md](DEMO.md)**. Troubleshooting: **[README.md#troubleshooting](../README.md#troubleshooting)**.
+Condensed speaker reference for live demos. Full narrative and timing: **[DEMO.md](DEMO.md)**. Drain workflow deep-dive: **[DEMO-DRAIN-WORKFLOW.md](DEMO-DRAIN-WORKFLOW.md)**. Troubleshooting: **[README.md#troubleshooting](../README.md#troubleshooting)**.
 
 ## Choose your track
 
@@ -8,7 +8,7 @@ Condensed speaker reference for live demos. Full narrative and timing: **[DEMO.m
 |-------|-------|----------|--------------|
 | **10 min** | 10m | [Quick demo — 3 concepts](#quick-demo--3-concepts-10-minutes) | `make setup` · `make demo-url` · `make act-pvc` · `make act-pdb` |
 | **30 min** | 30m | [Prep](#prep-before-the-room) · [1 GitOps](#1-gitops-deployment) · [3 PVC](#3-pvc-persistence) · [4 PDB](#4-pdb-protection) · [5 Eviction](#5-eviction-api) | `make preflight` · `make act-pvc` · `make act-pdb` |
-| **60 min** | 60m | [Suggested live order](#suggested-live-order) (sections 0–6) | `make act-drain` · `make uncordon` · `make argocd-resume-sync` · full cheat sheet below |
+| **60 min** | 60m | [Suggested live order](#suggested-live-order) (sections 0–6) | [API discovery](#api-discovery-optional-warm-up) · `make act-drain` · `make uncordon` · `make argocd-resume-sync` |
 
 Run `make preflight` before the room — validates overlays, checks the cluster, probes GitHub reachability, and prints Argo CD (`:30080`) and demo app (`:30090`) URLs.
 
@@ -57,6 +57,59 @@ make demo-url       # → http://localhost:30090/
 
 ---
 
+## API discovery (optional warm-up)
+
+**Talking point:** Kubernetes exposes hundreds of API paths. `kubectl api-resources` and `api-versions` list what you can create; `kubectl get --raw /apis` shows the raw discovery document. Voluntary disruption uses the **Eviction** subresource on pods (`policy/v1`) — it does **not** appear as its own row in `api-resources`.
+
+```bash
+# All API groups and versions on this cluster
+kubectl api-versions | sort
+
+# Core v1 — nodes, pods, services (cordon/drain touch Node; eviction touches Pod)
+kubectl api-resources --api-group="" | grep -E 'NAME|nodes|pods|services|endpoints'
+
+# Workload APIs — this demo uses StatefulSet (not Deployment)
+kubectl api-resources --api-group=apps | grep -E 'NAME|statefulset|deployment|replicaset'
+
+# Policy API — PodDisruptionBudget gates the Eviction API
+kubectl api-resources --api-group=policy
+
+# EndpointSlices — how Services track ready backends (traffic during drain)
+kubectl api-resources --api-group=discovery.k8s.io
+
+# Raw discovery JSON (no jq required)
+kubectl get --raw /apis
+kubectl get --raw /apis/policy/v1
+kubectl get --raw /apis/apps/v1
+kubectl get --raw /apis/discovery.k8s.io/v1
+
+# Live PDB objects in the demo namespace
+kubectl get --raw /apis/policy/v1/namespaces/demo/poddisruptionbudgets
+
+# Eviction is a pod subresource — POST via proxy (same path as make evict)
+# POST /api/v1/namespaces/demo/pods/demo-app-0/eviction
+kubectl proxy --port=38001 &
+until curl -sf http://localhost:38001/healthz >/dev/null; do sleep 0.2; done
+curl -s -w "\nHTTP %{http_code}\n" -X POST \
+  http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
+  -H 'Content-Type: application/json' \
+  -d '{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"demo-app-0","namespace":"demo"}}'
+kill %1
+```
+
+| Command | What it shows | Tie-in to this demo |
+|---------|---------------|---------------------|
+| `kubectl api-versions` | All `group/version` pairs | `policy/v1` (PDB + Eviction), `apps/v1` (StatefulSet) |
+| `kubectl api-resources` | Creatable kinds per group | `poddisruptionbudgets` in `policy`; no `evictions` row |
+| `kubectl get --raw /apis` | Server discovery document | Same info the API server advertises to clients |
+| Eviction POST | HTTP 201 or 429 | PDB `disruptionsAllowed` enforced at this layer |
+
+**Point:** `kubectl delete pod` bypasses this path — use `make evict` or `make drain` to demonstrate PDB enforcement.
+
+Full drain → eviction → EndpointSlice flow: **[DEMO-DRAIN-WORKFLOW.md](DEMO-DRAIN-WORKFLOW.md)**.
+
+---
+
 ## Quick demo — 3 concepts, ~10 minutes
 
 Fastest path through the demo. Run `make setup` first (or see raw setup commands below).
@@ -84,6 +137,7 @@ kubectl get pods,pvc,pdb -n demo -o wide
 
 # Evict a pod via the Eviction API (Eviction is a pod subresource — use proxy + curl)
 kubectl proxy --port=38001 &
+until curl -sf http://localhost:38001/healthz >/dev/null; do sleep 0.2; done
 curl -s -w "\nHTTP %{http_code}\n" -X POST \
   http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
   -H 'Content-Type: application/json' \
@@ -123,6 +177,7 @@ kubectl get pdb -n demo
 
 # Try to evict — HTTP 429: blocked by PDB
 kubectl proxy --port=38001 &
+until curl -sf http://localhost:38001/healthz >/dev/null; do sleep 0.2; done
 curl -s -w "\nHTTP %{http_code}\n" -X POST \
   http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
   -H 'Content-Type: application/json' \
@@ -180,6 +235,7 @@ kubectl get pods -n demo -w
 | # | Section | ~min | PDB mode |
 |---|---------|------|----------|
 | 0 | [Prep](#prep-before-the-room) | — | relaxed (default) |
+| 0b | [API discovery](#api-discovery-optional-warm-up) (optional) | 3 | relaxed |
 | 1 | [GitOps deployment](#1-gitops-deployment) | 5 | relaxed |
 | 2 | [Drift detection](#2-drift-detection) | 5 | relaxed |
 | 3 | [PVC persistence](#3-pvc-persistence) | 8 | relaxed |
@@ -227,6 +283,7 @@ After section 6, run `make uncordon` if any node is cordoned. Relaxed PDB is the
 | `make argocd-expose` | Argo CD UI at http://localhost:30080 (preferred on kind/Mac) |
 | `make demo-expose` | Demo app HTTP at http://localhost:30090 (preferred on kind/Mac) |
 | `make demo-url` | Print demo app URL and apply NodePort if needed |
+| `make demo-drain-doc` | Print path to drain workflow doc (`docs/DEMO-DRAIN-WORKFLOW.md`) |
 | `make argocd-pause-sync` | Pause automated sync (manual mode) |
 | `make argocd-resume-sync` | Resume automated sync with prune + selfHeal |
 | `make argocd-relaxed` | Argo CD desired state: relaxed PDB |
@@ -462,6 +519,7 @@ Manual eviction (same as `make evict` / `scripts/evict-pod.sh`):
 ```bash
 # Eviction is a pod subresource — use kubectl proxy + curl
 kubectl proxy --port=38001 &
+until curl -sf http://localhost:38001/healthz >/dev/null; do sleep 0.2; done
 curl -s -w "\nHTTP %{http_code}\n" -X POST \
   http://localhost:38001/api/v1/namespaces/demo/pods/demo-app-0/eviction \
   -H 'Content-Type: application/json' \
@@ -495,6 +553,8 @@ make evict
 ## 6. Cordon / drain / migrate
 
 **Talking point:** Node maintenance cordons the node, then drains pods via the Eviction API. Strict PDB blocks the whole drain; relaxed PDB permits one eviction, but kind's node-local PV affinity may keep the replacement pod Pending until the storage node is uncordoned.
+
+**Extended guide:** [DEMO-DRAIN-WORKFLOW.md](DEMO-DRAIN-WORKFLOW.md) — mermaid/ASCII flow diagram, EndpointSlice observation, StatefulSet replacement, Argo CD pause/resume (UI + kubectl + argocd CLI).
 
 ### Argo CD desired state + kubectl drain — strict blocks
 

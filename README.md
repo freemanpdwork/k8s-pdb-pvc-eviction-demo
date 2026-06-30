@@ -68,7 +68,7 @@ Or step by step:
 make cluster && make argocd && make argocd-app && make demo-data
 ```
 
-Full speaker script: **[docs/DEMO.md](docs/DEMO.md)**
+Full speaker script: **[docs/DEMO.md](docs/DEMO.md)** · Command cheat sheet: **[docs/DEMO-STEPS.md](docs/DEMO-STEPS.md)** · Drain workflow: **[docs/DEMO-DRAIN-WORKFLOW.md](docs/DEMO-DRAIN-WORKFLOW.md)**
 
 ## Troubleshooting
 
@@ -145,6 +145,25 @@ make argocd
 kubectl delete namespace argocd
 make argocd
 ```
+
+### `make argocd-app` fails: `configmap "argocd-cm" not found`
+
+```text
+{"level":"fatal","msg":"configmap \"argocd-cm\" not found"}
+```
+
+**Cause:** `argocd --core` reads Argo CD settings from the `argocd-cm` ConfigMap in the **Argo CD install namespace** (`argocd`). Without `--argocd-namespace`, the CLI may look in the wrong namespace (for example `default`). The `-N` flag on `app` commands is the **Application** namespace, not the install namespace.
+
+**Fix:**
+
+1. Install Argo CD first: `make argocd`
+2. Use an up-to-date Makefile — `ARGOCD_CLI` includes `--argocd-namespace argocd` and exports `ARGOCD_NAMESPACE`
+3. Confirm the ConfigMap exists:
+   ```bash
+   kubectl get configmap argocd-cm -n argocd
+   ```
+
+If the CLI still fails, `make argocd-app` falls back to server-side apply of `manifests/argocd/application.yaml` and waits for Synced/Healthy via `kubectl wait`.
 
 ### Argo CD UI not loading
 
@@ -343,7 +362,7 @@ make argocd-sync     # sync through argocd CLI
 make argocd-wait     # wait only (Application must already exist)
 ```
 
-`make argocd-app` uses `argocd --core`, so no Argo CD login is required. The Application still points at `DEMO_REPO_URL`; Argo CD owns the deployed Kubernetes resources.
+`make argocd-app` uses `argocd --core --argocd-namespace argocd`, so no Argo CD login is required. The Application still points at `DEMO_REPO_URL`; Argo CD owns the deployed Kubernetes resources.
 
 ### GitOps vs local deploy
 
@@ -360,7 +379,7 @@ For the primary demo, use Argo CD targets for desired-state changes. `kubectl` i
 
 ## Demo flow (summary)
 
-**Live command cheat sheet:** **[docs/DEMO-STEPS.md](docs/DEMO-STEPS.md)** (kubectl + k9s + Makefile shortcuts). Full speaker script: **[docs/DEMO.md](docs/DEMO.md)**.
+**Live command cheat sheet:** **[docs/DEMO-STEPS.md](docs/DEMO-STEPS.md)** (kubectl + k9s + Makefile shortcuts). Full speaker script: **[docs/DEMO.md](docs/DEMO.md)**. Drain → eviction → PDB → replacement: **[docs/DEMO-DRAIN-WORKFLOW.md](docs/DEMO-DRAIN-WORKFLOW.md)**.
 
 1. **Full bootstrap** — `make setup` (cluster + Argo CD + `demo-app` synced via GitOps); open http://localhost:30080 (no login)
 2. **k9s tour** — pods spread across workers, PVCs bound
@@ -368,7 +387,7 @@ For the primary demo, use Argo CD targets for desired-state changes. `kubectl` i
 4. **Relaxed PDB** — `make evict` succeeds (minAvailable: 1)
 5. **Git rollout** — change overlay, push, `make argocd-sync`
 6. **Strict PDB** — `make act-pdb`, Argo CD syncs strict desired state, Eviction API returns 429
-7. **Maintenance** — `make act-drain`, pause automated sync, cordon/drain, PDB blocks eviction
+7. **Maintenance** — `make act-drain`, pause automated sync, cordon/drain, PDB blocks eviction ([drain workflow doc](docs/DEMO-DRAIN-WORKFLOW.md))
 8. **Drift self-heal** — kubectl edit pod, Argo restores desired state after `make argocd-resume-sync`
 
 ## k9s cheat sheet
@@ -416,6 +435,7 @@ make argocd          # Install Argo CD (anonymous admin, HTTP) + NodePort expose
 make argocd-expose   # Expose Argo CD UI at http://localhost:30080 (kind/Mac)
 make demo-expose     # Expose demo app HTTP at http://localhost:30090 (kind/Mac)
 make demo-url        # Print demo app URL and apply NodePort if needed
+make demo-drain-doc  # Print path to drain workflow doc
 make port-forward    # Argo CD UI tunnel fallback (http://127.0.0.1:8888)
 make argocd-proxy    # kubectl proxy fallback for Argo CD UI
 make argocd-password # Initial admin password (CLI only)
